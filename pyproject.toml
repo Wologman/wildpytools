@@ -1,0 +1,13 @@
+[project]
+name = "wiltpytools"        # pip install wildlife-tools
+version = "0.1.0"
+description = "Python tools for ecology research"
+readme = "README.md"
+authors = [
+  { name = "Olly Powell", email = "olly@wekaresearch.com" }
+]
+dependencies = [
+  "numpy",
+  "pandas"
+]
+requires-python = ">=3.9"
