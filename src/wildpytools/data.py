@@ -1,4 +1,6 @@
 import pandas as pd
+from pathlib import Path
+import re
 
 def remove_rare_classes(target_df, pred_df, rare_threshold):
     col_sums = target_df.sum(axis=0)
@@ -64,28 +66,77 @@ def rename_predictions(rename_dict, df, merge_by=None):
 
 '''
 
-def raven_to_df(label_paths: list,
-                name_map: dict,
-                ):
-    """Converts raven tab delimited text files into a Pandas Dataframe
+def raven_to_df(data_dir: Path, name_map: dict):
+    """Converts Raven .selections.txt annotation files into a Pandas DataFrame
+    along with matched audio files.
 
     Args:
-        raven_txt (_type_): filepath as a text string or Path object
+        data_dir (Path | str): Directory containing audio + .selections.txt files
+        name_map (dict): Column renaming map for the Raven tables
     """
 
+    cols_to_keep = ['Filepath', 'Annotation','Begin Time (s)', 'End Time (s)', 'Low Freq (Hz)', 
+                    'High Freq (Hz)']
+
+    if not isinstance(data_dir, Path):
+        data_dir = Path(data_dir)
+
+    audio_exts = {".wav", ".ogg", ".flac"}
+
+    paired = {}
+    for audio_file in data_dir.iterdir():
+        if audio_file.suffix.lower() not in audio_exts:
+            continue
+
+        base = audio_file.stem  # e.g. "120401_07"
+
+        # Find all selection files that start with this base and end with .selections.txt
+        sel_matches = list(data_dir.glob(f"{base}*.selections.txt"))
+
+        if sel_matches:
+            paired[base] = {
+                "audio": audio_file,
+                "selections": sel_matches[0]
+            }
+    
+    #print(paired)
+
+    # Only keep stems present in both
+    #common_stems = audio_files.keys() & sel_files.keys()
+
+    #paired_audio = [audio_files[stem] for stem in sorted(common_stems)]
+    #paired_sels = [sel_files[stem] for stem in sorted(common_stems)]
+
+
+    #print(common_stems)
+
+
     dfs = []
-    for path in label_paths:
+    for key in paired:
+        sel_path = paired[key]['selections']
+        print(sel_path)
+        audio_path = paired[key]['audio']
         df = pd.read_csv(
-            path,
+            sel_path,
             sep='\t',            # Tab delimiter
             header=0,            # First line is header; use None if no header
             encoding='utf-8',    # Explicit encoding
             na_values=['', 'NA'],# Treat empty strings or 'NA' as NaN
             engine='python'      # Use Python engine for complex files (optional)
         )
+        df['Filepath'] = [sel_path] * len(df)
+        df = df[cols_to_keep]
+
+        if "View" in df.columns:
+            df = df[df["View"].str.contains("Spectrogram", case=False, na=False)]
+
         dfs.append(df)
 
-    return pd.concat(dfs, index = 0)
+    if len(dfs) > 1:
+        return pd.concat(dfs, axis = 0)
+    else: 
+        return dfs[0]
+
 
 
 def avenza_to_df(label_paths: list,
