@@ -19,6 +19,7 @@ from typing import Literal
 from joblib import Parallel, delayed
 import soundfile as sf
 import logging
+import re
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
@@ -179,8 +180,25 @@ def load_from_anqa(dir_path: Path,
                    metadata_path: Path,
                    labels_path: Path,
                    name_map: Optional[dict] = None):
-    #placeholder
-    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    
+    try:
+        df_labels = pd.read_csv(labels_path)
+        print(df_labels.head())
+        if len(df_labels) < 1:
+            logger.warning('Warning: The labels dataframe is empty')
+    except Exception as e:
+        logger.error("Unable to load labels dataframe")
+        df_labels = pd.DataFrame()
+
+    try:
+        df_meta = pd.read_csv(metadata_path)
+        if len(df_meta) < 1:
+            logger.warning('Warning: The metadata dataframe is empty')
+    except Exception as e:
+        logger.error("Unable to metadata dataframe")
+        df_meta = pd.DataFrame()
+
+    return df_labels, df_meta, pd.DataFrame()  #placeholder
 
 
 def load_from_birdclef(dir_path: Path,
@@ -601,9 +619,11 @@ def avg_power_density(wav: np.ndarray,
     return round(10 * np.log10(power_density + 1e-12), 1)
 
 
-def anqa_to_raven(df: pd.DataFrame,
-                  destn_dir: Path):
-        '''Converts an anqa formatted dataframe Raven selections files
+def anqa_to_raven_selections(df: pd.DataFrame,
+                             destn_dir: Path):
+        '''Creates .selections.txt tab seperated annotations
+        for visualisation of spectrogram labels in Raven
+        (https://www.ravensoundsoftware.com/)
         '''
         destn_dir = Path(destn_dir)
         rename_cols = {"Label": "Annotation", "Start Time (s)": "Begin Time (s)"}
@@ -628,7 +648,6 @@ def anqa_to_raven(df: pd.DataFrame,
             group.to_csv(selections_destn, sep='\t', index=False)
 
 
-
 class ToAnqa:
     def __init__(self,
                  source_dir: Union[str, Path],
@@ -646,6 +665,8 @@ class ToAnqa:
         
         self.source_dir = Path(source_dir)
         self.destn_dir = Path(destn_dir)
+        self.audio_destn = self.destn_dir / 'audio'
+        self.audio_destn.mkdir(exist_ok=True, parents=True)
         self.name_map = name_map
         self.save_audio = save_audio
         self.max_seconds = max_seconds
@@ -703,15 +724,31 @@ class ToAnqa:
         #selections_destn = self.destn_dir / f'{file_stem}.Table.1.selections.txt'
         #segment['selections'].to_csv(selections_destn, sep='\t', index=False)
         if self.save_audio:
-            audio_destn = self.destn_dir / f'{file_stem}.flac'
+            destn = self.audio_destn / f'{file_stem}.flac'
             if segment['sr'] != self.default_sr:
                 num_samples = int(len(segment['wave']) * self.default_sr / segment['sr'])
                 part = resample(part, num_samples)
-            sf.write(audio_destn, segment['wave'], self.default_sr)
+            sf.write(destn, segment['wave'], self.default_sr)
 
-    def segment_audio(self, wav, sr, filename, df, df_meta):
+    def segment_audio(self,
+                      wav,
+                      sr,
+                      filename, 
+                      df,
+                      df_meta,
+                      min_remainder_length_sec = 1):
         """Break up longer audio files into fixed-length segments,
-        optionally pad shorter ones, and adjust label times accordingly."""
+        optionally pad shorter ones, and adjust label times accordingly.
+        The remainder from any non-whole segments will be discarded if less
+        than min_remainder_length_sec"""
+
+        def compute_num_segments(wav_length, segment_length, min_segment):
+            num = int(np.ceil(wav_length / segment_length))
+            remainder = wav_length - (num - 1) * segment_length
+            if num > 1 and remainder < min_segment:
+                num -= 1
+                remainder = 0
+            return max(1, num), remainder
 
         max_seconds = self.max_seconds
         end_padding = self.end_padding
@@ -720,8 +757,30 @@ class ToAnqa:
         wav_length = len(wav)
         original_len_secs = wav_length // sr
 
-        num_segments = max(1, wav_length // segment_length + 1) 
-        remainder = wav_length % segment_length
+        #Need to identify if this is a second or subsequent conversion.     
+        # Filepath will have a   from_xx.flac
+        # Same for the filename column in the dataframe
+        # Need to extract this integer (if any) and add it to the future filename integer
+        # Also need to avoid doubling up the _from_xx  characters.
+
+        # Fill default boxes to the whole clip
+        df['Start Time (s)'] = df['Start Time (s)'].fillna(0.0)
+        df['End Time (s)'] = df['End Time (s)'].fillna(round(original_len_secs, 1)) #no point including the padding
+        df['Low Freq (Hz)'] = df['Low Freq (Hz)'].fillna(0).astype(float)
+        df['High Freq (Hz)'] = df['High Freq (Hz)'].fillna(16000).astype(float)
+
+        
+
+
+        # Need to identify any previous crops from the source
+        # Then calculate the start times as per the various possible cropping schemes
+        # Create a list of start and end times.
+        # Have only one branch that iterates through that list.
+
+
+        num_segments, remainder = compute_num_segments(wav_length,
+                                                       segment_length,
+                                                       sr*min_remainder_length_sec)
 
         # --- Optional padding step for final segment ---
         if remainder != 0 and end_padding is not None:
@@ -736,82 +795,33 @@ class ToAnqa:
                 pad = np.array([])
             wav = np.concatenate([wav, pad])
 
-        # Fill default boxes to the whole clip
-        df['Start Time (s)'] = df['Start Time (s)'].fillna(0.0)
-        df['End Time (s)'] = df['End Time (s)'].fillna(round(original_len_secs, 1)) #no point including the padding
-        df['Low Freq (Hz)'] = df['Low Freq (Hz)'].fillna(0).astype(float)
-        df['High Freq (Hz)'] = df['High Freq (Hz)'].fillna(16000).astype(float)
-
-        segments = []
-
-        if crop_method == 'keep_all':
-            #Do something about the code duplication here
+        seg_idxs = []
+        if wav_length <= segment_length:
+            start_idx = 0
+            end_idx = wav_length
+            seg_idxs.append((start_idx, end_idx))
+        elif crop_method == 'keep_all':
             for i in range(num_segments):
                 start_idx = i * segment_length
                 end_idx = min((i+1) * segment_length, len(wav))
-                segment_wav = wav[start_idx:end_idx]
+                seg_idxs.append((start_idx, end_idx))
+        else:
+            start_idx = np.random.choice(wav_length - segment_length)
+            end_idx = start_idx + segment_length
+            seg_idxs.append((start_idx, end_idx))
 
-                start_time = start_idx / sr
-                end_time = end_idx / sr
+        segments = []
 
-                #Take only rows where the label overlaps with that segment
-                seg_df = df[
+        for idxs in seg_idxs:
+            start_idx = idxs[0]
+            end_idx = idxs[1]
+            start_time = start_idx / sr
+            end_time = end_idx / sr
+            #Take only rows where the label overlaps with that segment
+            seg_df = df[
                     (df["Start Time (s)"] < end_time) &
                     (df["End Time (s)"] > start_time)
                 ].copy()
-
-                seg_fname = f"{Path(filename).stem}_from_{int(i*self.max_seconds)}.flac"
-                meta_df = df_meta.copy()
-                meta_df['filename'] = seg_fname
-                meta_df['source_file'] = filename
-                meta_df['source_start_s'] = f'{start_time:.1f}'
-                meta_df['source_end_s'] = f'{end_time:.1f}'
-
-                seg_df["Filename"] = seg_fname
-                seg_df["Start Time (s)"] -= start_time 
-                seg_df["End Time (s)"] -= start_time
-                seg_df["Start Time (s)"] = seg_df["Start Time (s)"].clip(lower=0)
-                seg_df["End Time (s)"] = seg_df["End Time (s)"].clip(lower=0, upper=(end_time - start_time))
-
-
-                seg_df = self._validate_labels(seg_df, wav, sr)
-                power_results = []
-
-                for idx, row in seg_df.iterrows():
-                    val = avg_power_density(
-                        segment_wav,
-                        sr,
-                        float(row["Start Time (s)"]),
-                        float(row["End Time (s)"]),
-                        float(row["Low Freq (Hz)"]),
-                        float(row["High Freq (Hz)"]),
-                    )
-                    power_results.append(val)
-
-                seg_df["Avg Power Density (dB FS/Hz)"] = power_results
-
-                segments.append({
-                    "filename": f"{Path(filename).stem}_from_{int(i*self.max_seconds)}.flac",
-                    "wave": segment_wav,
-                    "sr": sr,
-                    "labels_df": seg_df,
-                    "meta_df": meta_df,
-                })
-        else:
-            if wav_length <= segment_length:
-                segment_wav = wav  # or pad/crop etc.
-            else:
-                start_idx = np.random.choice(wav_length - segment_length)
-                end_idx = start_idx + segment_length
-                segment_wav = wav[start_idx:end_idx]
-
-            start_time = start_idx / sr
-            end_time = end_idx / sr
-
-            seg_df = df[
-                (df["Start Time (s)"] < end_time) &
-                (df["End Time (s)"] > start_time)
-            ].copy()
 
             seg_fname = f"{Path(filename).stem}_from_{int(start_time)}.flac"
             meta_df = df_meta.copy()
@@ -822,27 +832,30 @@ class ToAnqa:
 
             seg_df["Filename"] = seg_fname
             seg_df["Start Time (s)"] -= start_time 
-            seg_df["End Time (s)"] -= end_time
+            seg_df["End Time (s)"] -= start_time
             seg_df["Start Time (s)"] = seg_df["Start Time (s)"].clip(lower=0)
             seg_df["End Time (s)"] = seg_df["End Time (s)"].clip(lower=0, upper=(end_time - start_time))
 
+            segment_wav = wav[start_idx:end_idx]
+            seg_df = self._validate_labels(seg_df, wav, sr)
             power_results = []
 
-            for idx, row in seg_df.iterrows():
-                val = avg_power_density(
-                    segment_wav,
-                    sr,
-                    float(row["Start Time (s)"]),
-                    float(row["End Time (s)"]),
-                    float(row["Low Freq (Hz)"]),
-                    float(row["High Freq (Hz)"]),
-                )
-                power_results.append(val)
 
-            seg_df["power density"] = power_results
+            for idx, row in seg_df.iterrows():
+                power = avg_power_density(
+                        segment_wav,
+                        sr,
+                        float(row["Start Time (s)"]),
+                        float(row["End Time (s)"]),
+                        float(row["Low Freq (Hz)"]),
+                        float(row["High Freq (Hz)"]),
+                    )
+                power_results.append(power)
+
+            seg_df["Avg Power Density (dB FS/Hz)"] = power_results
 
             segments.append({
-                    "filename": f"{Path(filename).stem}_from_{start_idx//sr}.flac",
+                    "filename": f"{Path(filename).stem}_from_{int(start_time)}.flac",
                     "wave": segment_wav,
                     "sr": sr,
                     "labels_df": seg_df,
@@ -875,7 +888,7 @@ class ToAnqa:
 
     def convert_all(self, df_labels: pd.DataFrame, df_meta: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Convert all grouped recordings from two DataFrames using different grouping columns."""
-        
+
         grouped_labels = df_labels.groupby('Filename')
         grouped_meta = df_meta.groupby('filename')
 
@@ -905,8 +918,6 @@ class ToAnqa:
         metadata = pd.concat(flattened_metadata, ignore_index=True)
 
         return self.review_labels, metadata,  #raven_labels,
-
-
 
 
 def predictions_to_annotations(df: pd.DataFrame,
