@@ -57,6 +57,13 @@ logger = logging.getLogger(__name__)
    * For rare cases where long birdsong start/stop not found above, crop to max_time
 '''
 
+#Helper functions
+def tail_path(path, depth: int):
+    p = Path(path)
+    return Path(*p.parts[-depth:]).as_posix()
+
+
+
 def pair_audio_labels(data_dir: Union[Path,str],
                       match_suffix: str,
                       label_dir: Optional[Union[Path,str]] = None
@@ -104,28 +111,38 @@ def combine_dfs(dfs: Sequence[pd.DataFrame], cols: Sequence[str]) -> pd.DataFram
 
 
 def load_from_raven(data_dir: Union[str, Path],
-                    name_map: Optional[dict] = None):
-    """Converts Raven .selections.txt annotation files into a Pandas DataFrame
-    along with matched audio files.
-    Only column change is the addtion of a Filepath
+                    name_map: Optional[dict] = None,
+                    metadata_path: Optional[Union[str, Path]] = None,
+                    metadata_dict: Optional[dict] = None):
+    
+    """
+    Converts Raven .selections.txt annotation files into a Pandas DataFrame
+    along with matched audio files. The only column change is the addition 
+    of a Filepath
 
     Args:
         data_dir (Path | str): Directory containing audio + .selections.txt files
         name_map (dict): Column renaming map for the Raven tables
+        metadata_csv (Path | str): A CSV file with metadata and matching filenames
+        metadata_dict (dict): Optional metadata that can update the csv data
     """
 
-    cols_to_keep = ['Filepath',	'Start Time (s)', 'End Time (s)',	
-                    'Low Freq (Hz)',  'High Freq (Hz)',	'Label']
+    annot_cols_to_keep = ['Filename',	'Start Time (s)', 'End Time (s)',	
+                          'Low Freq (Hz)',  'High Freq (Hz)',	'Label', 
+                          'Type', 'Rating', 'Delta Time (s)', 'Delta Freq (Hz)',
+                          'Avg Power Density (dB FS/Hz)','Filepath']
 
     if not isinstance(data_dir, Path):
         data_dir = Path(data_dir)
 
+    print(f'The data dir is {data_dir}')
     paired = pair_audio_labels(data_dir, '.selections.txt')
 
     dfs = []
     invalid_dfs = []
     for key in tqdm (paired):
         sel_path = paired[key]['labels']
+        audio_path = paired[key]['audio']
 
         df = pd.read_csv(
             sel_path,
@@ -138,8 +155,18 @@ def load_from_raven(data_dir: Union[str, Path],
         if 'Filepath' in df.columns:
             df = df[['Filepath'] + [c for c in df.columns if c != 'Filepath']]
         else:
-            df.insert(0, 'Filepath', [sel_path] * len(df))
+            df.insert(0, 'Filepath', [audio_path] * len(df))
 
+        cols_to_check = {'Type', 'Rating'}
+        missing_cols = cols_to_check - set(df.columns)
+        for col in missing_cols:
+            df[col] = pd.NA
+
+
+        base_dir = Path(data_dir).resolve()
+        df["Filename"] = df["Filepath"].apply(
+            lambda p: str(Path(p).resolve().relative_to(base_dir))
+        )
         if "View" in df.columns:
             #remove any view rows, as they won't be needed
             df = df[df["View"].str.contains("Spectrogram", case=False, na=False)]
@@ -153,7 +180,6 @@ def load_from_raven(data_dir: Union[str, Path],
             mapped_values = set(name_map.values())
             df["Label"] = df["Label"].where(df["Label"].isin(mapped_values), pd.NA)
 
-        
         # Optimized check: values are strings (not NA and type is str)
         # Using type() is faster than isinstance() in apply, and we filter NA first for efficiency
         valid_1 = df['Label'].notna() & (df['Label'].apply(type) == str)
@@ -170,10 +196,27 @@ def load_from_raven(data_dir: Union[str, Path],
         dfs.append(valids)
         invalid_dfs.append(errors)
 
-    valids = combine_dfs(dfs, cols=cols_to_keep)
-    invalids = combine_dfs(invalid_dfs, cols=cols_to_keep)
+    valids = combine_dfs(dfs, cols=annot_cols_to_keep)
+    invalids = combine_dfs(invalid_dfs, cols=annot_cols_to_keep)
 
-    return valids, invalids
+    if metadata_path is not None:
+        df_meta = pd.read_csv(metadata_path) #Placeholder
+    else: 
+        filepaths = sorted(list(set(valids['Filepath'])))
+        filenames = sorted(list(set(valids['Filename'])))
+        df_meta = pd.DataFrame([metadata_dict]*len(filenames))
+        df_meta['filepath'] = filepaths
+        df_meta['filename'] = filenames
+        df_meta['source_filename'] = filenames
+
+    #final_label_cols = ['Filepath', 'Start Time (s)', 'End Time (s)', 
+    #                    'Low Freq (Hz)', 'High Freq (Hz)', 'Delta Time (s)',
+    #                    'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)', 
+    #                    'Label', 'Type', 'Rating', 'Filename']
+    
+    #valids = valids[final_label_cols]
+
+    return valids, df_meta, invalids  #This isn't what we mean by invalids.  Use the metadata df
 
 
 def load_from_anqa(dir_path: Path,
@@ -198,7 +241,29 @@ def load_from_anqa(dir_path: Path,
         logger.error("Unable to metadata dataframe")
         df_meta = pd.DataFrame()
 
-    return df_labels, df_meta, pd.DataFrame()  #placeholder
+    return df_labels, df_meta, pd.DataFrame()  #placeholder for invalid rows
+
+
+def add_missing_label_columns(df):
+    float_cols = [
+        'Start Time (s)', 'End Time (s)',
+        'Low Freq (Hz)', 'High Freq (Hz)'
+    ]
+    for col in float_cols:
+        if col not in df.columns:
+            df[col] = pd.Series(index=df.index, dtype='float64')
+
+    datetime_cols = ['recorded_on', 'reviewed_on']
+    for col in datetime_cols:
+        if col not in df.columns:
+            df[col] = pd.Series(index=df.index, dtype='datetime64[ns]')
+
+    text_cols = ['reviewed_by']
+    for col in text_cols:
+        if col not in df.columns:
+            df[col] = pd.Series(index=df.index, dtype='string')
+
+    return df
 
 
 def load_from_birdclef(dir_path: Path,
@@ -214,7 +279,7 @@ def load_from_birdclef(dir_path: Path,
         cols_to_keep (Optional[list], optional): Columns to display and save. 
                      Defaults to ['filename', primary_label, 'secondary_labels']
     """
-    
+
     def rename_list(lst):
         if isinstance(lst, str):
             try:
@@ -240,61 +305,32 @@ def load_from_birdclef(dir_path: Path,
         df["primary_label"] = df["primary_label"].map(name_map).fillna(df["primary_label"])
         df["secondary_labels"] = df["secondary_labels"].apply(rename_list)
 
-    new_cols = ['Start Time (s)', 'End Time (s)',
-                'Low Freq (Hz)','High Freq (Hz)']
-    for col in new_cols:
-        if col not in df.columns:
-            df[col] = pd.Series(dtype='float')
-    
-    date_cols = ['recorded_on']
-    for col in date_cols:
-        if col not in df.columns:
-            df[col] = pd.Series(dtype='datetime64[ns]')
+    df = df.rename(columns={
+    'primary_label': 'Label',
+    'type': 'Type',
+    'rating': 'Rating',
+})
 
-    text_cols = ['reviewed_by']
-    for col in text_cols:
-        if col not in df.columns:
-            df[col] = pd.Series(dtype='string')
+    df = add_missing_label_columns(df)
 
-    date_cols = ['reviewed_on']
-    for col in date_cols:
-        if col not in df.columns:
-            df[col] = pd.Series(dtype='datetime64[ns]')
-
-    df['Label'] = df['primary_label']
-
-    #cols_to_move = ['Label', 'Start Time (s)', 'End Time (s)', 'Low Freq (Hz)','High Freq (Hz)']
-    #df_labels = pd.DataFrame({c: df.pop(c) for c in cols_to_move})
-
-    #df_labels['Filename'] = df['filename']
-    #df_labels['Filepath'] = df['filename'].apply(lambda p: dir_path / p)
-    #df_labels = df_labels[['Filename'] + cols_to_move + ['Filepath']]
-
+    print(f'After adding the missing labels \n {df.head()}')
 
     # Add a filepath column so we can test existence
-    df['Filepath'] = df['filename'].apply(lambda p: dir_path / p)
+    df['filepath'] = df['filename'].apply(lambda p: dir_path / p)
+    mask_exists = df['filepath'].apply(lambda p: p.exists())
 
-    # Boolean mask of which files exist
-    mask_exists = df['Filepath'].apply(lambda p: p.exists())
-
-    # Missing rows for separate reporting
+    # Now format the source_filename and filename columns
+    #df['filename'] = #df['Filepath'].apply(lambda x: tail_path(x, depth=2))
+    df['source_filename'] = df['filename'] #df['Filepath'].apply(lambda x: tail_path(x, depth=2))
     df_missing = df[~mask_exists].copy()
-
-    # Keep only rows that exist
     df = df[mask_exists].copy()
 
-    # Now safe to split
-    df['Label'] = df['primary_label']
-
-    cols_to_move = [
-        'Label', 'Start Time (s)', 'End Time (s)',
-        'Low Freq (Hz)', 'High Freq (Hz)'
-    ]
-
+    cols_to_move = ['Label', 'Start Time (s)', 'End Time (s)',
+                    'Low Freq (Hz)', 'High Freq (Hz)', 'Type', 'Rating']
     df_labels = pd.DataFrame({c: df.pop(c) for c in cols_to_move})
 
     df_labels['Filename'] = df['filename']
-    df_labels['Filepath'] = df['Filepath']  # already computed
+    df_labels['Filepath'] = df['filepath']  # already computed
     df_labels = df_labels[['Filename'] + cols_to_move + ['Filepath']]
 
     return df_labels, df, df_missing
@@ -661,6 +697,7 @@ class ToAnqa:
                  crop_method: Literal['keep_all'] = 'keep_all', # Future: 'random', 'max_annotations', 'max_detections'
                  default_sr: int = 32000,
                  n_jobs: int = 0,
+                 destn_depth: int = 2,
                  ):
         
         self.source_dir = Path(source_dir)
@@ -679,6 +716,7 @@ class ToAnqa:
         self.default_sr = default_sr
         self.n_jobs = n_jobs
         self.parallel = False if n_jobs == 0 else True
+        self.destn_depth = destn_depth
 
         # --- Validation check ---
         if self.save_audio and self.source_dir == self.destn_dir:
@@ -718,25 +756,23 @@ class ToAnqa:
 
         return df    
 
-
     def save_one_segment(self, segment: dict):
         file_stem = Path(segment['filename']).stem
-        #selections_destn = self.destn_dir / f'{file_stem}.Table.1.selections.txt'
-        #segment['selections'].to_csv(selections_destn, sep='\t', index=False)
         if self.save_audio:
             destn = self.audio_destn / f'{file_stem}.flac'
+            wav = segment['wave']
             if segment['sr'] != self.default_sr:
-                num_samples = int(len(segment['wave']) * self.default_sr / segment['sr'])
-                part = resample(part, num_samples)
-            sf.write(destn, segment['wave'], self.default_sr)
+                num_samples = int(len(wav) * self.default_sr / segment['sr'])
+                wav = resample(wav, num_samples)
+            sf.write(destn, wav, self.default_sr)
 
     def segment_audio(self,
-                      wav,
-                      sr,
-                      filename, 
-                      df,
-                      df_meta,
-                      min_remainder_length_sec = 1):
+                      wav: np.ndarray,
+                      sr: int,
+                      filename: str, 
+                      df: pd.DataFrame,
+                      meta_dict: dict,
+                      min_remainder_length_sec: float = 1):
         """Break up longer audio files into fixed-length segments,
         optionally pad shorter ones, and adjust label times accordingly.
         The remainder from any non-whole segments will be discarded if less
@@ -763,20 +799,28 @@ class ToAnqa:
         # Need to extract this integer (if any) and add it to the future filename integer
         # Also need to avoid doubling up the _from_xx  characters.
 
+        file_stem = Path(filename).stem
+        segmented_previously = bool(re.search(r"_from_\d+$", file_stem))
+        if segmented_previously:
+            #Default to the metadata offset value, but use the filepath extracted one as a fallback
+            if meta_dict is not None:
+                offset = int(re.search(r"_from_(\d+)$", file_stem).group(1)) if segmented_previously else 0
+                offset = meta_dict.get('source_start_s') or offset
+        else:
+            offset = 0
+
+        clean_stem = re.sub(r"_from_\d+$", "", file_stem) if segmented_previously else file_stem
+
         # Fill default boxes to the whole clip
         df['Start Time (s)'] = df['Start Time (s)'].fillna(0.0)
         df['End Time (s)'] = df['End Time (s)'].fillna(round(original_len_secs, 1)) #no point including the padding
         df['Low Freq (Hz)'] = df['Low Freq (Hz)'].fillna(0).astype(float)
         df['High Freq (Hz)'] = df['High Freq (Hz)'].fillna(16000).astype(float)
 
-        
-
-
         # Need to identify any previous crops from the source
         # Then calculate the start times as per the various possible cropping schemes
         # Create a list of start and end times.
         # Have only one branch that iterates through that list.
-
 
         num_segments, remainder = compute_num_segments(wav_length,
                                                        segment_length,
@@ -812,6 +856,8 @@ class ToAnqa:
 
         segments = []
 
+        base_meta = meta_dict.copy() if meta_dict is not None else {}
+
         for idxs in seg_idxs:
             start_idx = idxs[0]
             end_idx = idxs[1]
@@ -823,14 +869,16 @@ class ToAnqa:
                     (df["End Time (s)"] > start_time)
                 ].copy()
 
-            seg_fname = f"{Path(filename).stem}_from_{int(start_time)}.flac"
-            meta_df = df_meta.copy()
-            meta_df['filename'] = seg_fname
-            meta_df['source_file'] = filename
-            meta_df['source_start_s'] = f'{start_time:.1f}'
-            meta_df['source_end_s'] = f'{end_time:.1f}'
+            ref_start_time = start_time + offset
+            ref_end_time = end_time + offset
+            seg_fname = f"{clean_stem}_from_{int(ref_start_time)}.flac" #for save destn
+            col_fname = tail_path(str(seg_fname),depth=self.destn_depth) #for csv
+            seg_meta_dict = base_meta.copy()
+            seg_meta_dict['filename'] = col_fname
+            seg_meta_dict['source_start_s'] = f'{ref_start_time:.1f}'
+            seg_meta_dict['source_end_s'] = f'{ref_end_time:.1f}'
 
-            seg_df["Filename"] = seg_fname
+            seg_df["Filename"] = col_fname
             seg_df["Start Time (s)"] -= start_time 
             seg_df["End Time (s)"] -= start_time
             seg_df["Start Time (s)"] = seg_df["Start Time (s)"].clip(lower=0)
@@ -839,7 +887,6 @@ class ToAnqa:
             segment_wav = wav[start_idx:end_idx]
             seg_df = self._validate_labels(seg_df, wav, sr)
             power_results = []
-
 
             for idx, row in seg_df.iterrows():
                 power = avg_power_density(
@@ -853,13 +900,16 @@ class ToAnqa:
                 power_results.append(power)
 
             seg_df["Avg Power Density (dB FS/Hz)"] = power_results
+            seg_meta_dict.pop('filepath', None)
+            seg_df['Delta Time (s)'] = seg_df['End Time (s)'] - seg_df['Start Time (s)']
+            seg_df['Delta Freq (Hz)'] = seg_df['High Freq (Hz)'] - seg_df['Low Freq (Hz)']
 
             segments.append({
-                    "filename": f"{Path(filename).stem}_from_{int(start_time)}.flac",
+                    "filename": seg_fname,
                     "wave": segment_wav,
                     "sr": sr,
                     "labels_df": seg_df,
-                    "meta_df": meta_df,
+                    "meta_dict": seg_meta_dict,
                 })
 
         return segments
@@ -871,20 +921,27 @@ class ToAnqa:
         cols_to_keep = ['Filename', 'Label', 'Start Time (s)', 'End Time (s)', 'Low Freq (Hz)', 'High Freq (Hz)']
         df = df[cols_to_keep].copy()
 
+        if df_meta is not None:
+            if len(df_meta) != 1:
+                raise ValueError(f"Unexpected duplicate metadata rows for {df_meta.iloc[0].get('filename')}, {len(df_meta)} rows found")
+            meta_dict = df_meta.iloc[0].to_dict()
+
         wav, sr = load_audio(self.source_dir / filename)
         if wav is None:  # Should handle None return from load_audio
             return []  # Return empty list if audio failed to load
 
         if self.save_audio:
-            segmented = self.segment_audio(wav, sr, filename, df, df_meta)
+            segmented = self.segment_audio(wav, sr, filename, df, meta_dict)
         else:
-            segmented = [{'Filename': filename, 'labels_df': df, 'wave' : wav, 'sr': sr, 'meta_df': df_meta}]
+            meta_dict.pop('filepath', None)
+            segmented = [{'filename': filename, 'labels_df': df, 'wave' : wav, 'sr': sr, 'meta_dict': meta_dict.copy() if meta_dict is not None else {}}]
         #At this point the df in 'labels_df' should contain one row for any split up files.
-        for segment in segmented:
-            #segment['selections'] = make_raven_df(segment['labels_df'], segment['wave'], segment['sr'], self.name_map)
-            #This is the reviewing df re-formatted into raven columns
-            self.save_one_segment(segment)
+
+        if self.save_audio:
+            for segment in segmented:
+                self.save_one_segment(segment)
         return segmented
+
 
     def convert_all(self, df_labels: pd.DataFrame, df_meta: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Convert all grouped recordings from two DataFrames using different grouping columns."""
@@ -893,7 +950,8 @@ class ToAnqa:
         grouped_meta = df_meta.groupby('filename')
 
         # Find filenames that exist in both
-        common_filenames = grouped_labels.groups.keys() & grouped_meta.groups.keys()
+        #common_filenames = grouped_labels.groups.keys() & grouped_meta.groups.keys()
+        common_filenames = [fname for fname in df_labels['Filename'].unique() if fname in grouped_meta.groups]
 
         # Build a list of (filename, group_from_df1, group_from_df2)
         groups = [(fname, grouped_labels.get_group(fname), grouped_meta.get_group(fname)) for fname in common_filenames]
@@ -910,14 +968,31 @@ class ToAnqa:
             ]
 
         flattened_labels = [seg['labels_df'] for file_segments in results for seg in file_segments]
-        #flattened_selections = [seg['selections'] for file_segments in results for seg in file_segments]
-        flattened_metadata = [seg['meta_df'] for file_segments in results for seg in file_segments]
+        flattened_metadata = [seg['meta_dict'] for file_segments in results for seg in file_segments]
 
         self.review_labels = pd.concat(flattened_labels, ignore_index=True)
-        #raven_labels = pd.concat(flattened_selections, ignore_index=True)
-        metadata = pd.concat(flattened_metadata, ignore_index=True)
+        metadata_df = pd.DataFrame(flattened_metadata)
 
-        return self.review_labels, metadata,  #raven_labels,
+        #Need to add any missing columns with empty values
+        #Ignore primary_label, type & rating.  Type and rating really ought to be in annotations
+        self.review_labels = add_missing_label_columns(self.review_labels)
+
+        final_label_cols = ['Filename',	'Start Time (s)', 'End Time (s)', 'Low Freq (Hz)', 
+                            'High Freq (Hz)',	'Label', 'Type', 'Rating', 'Delta Time (s)',
+                            'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)']
+        
+        final_metadata_cols = ['filename', 'collection', 'secondary_labels', 'url',
+                               'latitude', 'longitude', 'author', 'license',
+                               'recorded_on', 'reviewed_by', 'reviewed_on',
+                               'source_filename', 'source_start_s', 'source_end_s']
+        
+        for df, cols in zip([self.review_labels, metadata_df],
+                            [final_label_cols, final_metadata_cols]):
+            missing_cols = set(cols) - set(df.columns)
+            for col in missing_cols:
+                df[col] = pd.NA
+
+        return self.review_labels[final_label_cols], metadata_df[final_metadata_cols]
 
 
 def predictions_to_annotations(df: pd.DataFrame,
