@@ -1,7 +1,7 @@
 import pandas as pd
 from pathlib import Path
 import json
-from typing import Optional, Union, Sequence, Literal, Tuple
+from typing import Optional, Union, Sequence, Literal, Tuple, Set
 import xml.etree.ElementTree as ET
 from tqdm import tqdm
 import IPython.display as ipd
@@ -139,7 +139,6 @@ def load_from_raven(data_dir: Union[str, Path],
     paired = pair_audio_labels(data_dir, '.selections.txt')
 
     dfs = []
-    invalid_dfs = []
     for key in tqdm (paired):
         sel_path = paired[key]['labels']
         audio_path = paired[key]['audio']
@@ -180,53 +179,106 @@ def load_from_raven(data_dir: Union[str, Path],
             mapped_values = set(name_map.values())
             df["Label"] = df["Label"].where(df["Label"].isin(mapped_values), pd.NA)
 
-        # Optimized check: values are strings (not NA and type is str)
-        # Using type() is faster than isinstance() in apply, and we filter NA first for efficiency
         valid_1 = df['Label'].notna() & (df['Label'].apply(type) == str)
-        # Vectorized check: values are numeric (int or float) and not NA
-        # Check if column is numeric dtype OR individual values are numeric types
         is_numeric_col = pd.api.types.is_numeric_dtype(df['Start Time (s)'])
         valid_2 = df['Start Time (s)'].notna() & (is_numeric_col | df['Start Time (s)'].apply(type).isin([int, float]))
         is_numeric_col_end = pd.api.types.is_numeric_dtype(df['End Time (s)'])
         valid_3 = df['End Time (s)'].notna() & (is_numeric_col_end | df['End Time (s)'].apply(type).isin([int, float]))
         
         valids = df[valid_1 & valid_2 & valid_3]
-        errors = df[~valid_1 | ~valid_2 | ~valid_3]
 
         dfs.append(valids)
-        invalid_dfs.append(errors)
 
-    valids = combine_dfs(dfs, cols=annot_cols_to_keep)
-    invalids = combine_dfs(invalid_dfs, cols=annot_cols_to_keep)
+    valid_labels = combine_dfs(dfs, cols=annot_cols_to_keep)
 
     if metadata_path is not None:
         df_meta = pd.read_csv(metadata_path) #Placeholder
     else: 
-        filepaths = sorted(list(set(valids['Filepath'])))
-        filenames = sorted(list(set(valids['Filename'])))
+        filepaths = sorted(list(set(valid_labels['Filepath'])))
+        filenames = sorted(list(set(valid_labels['Filename'])))
         df_meta = pd.DataFrame([metadata_dict]*len(filenames))
         df_meta['filepath'] = filepaths
         df_meta['filename'] = filenames
         df_meta['source_filename'] = filenames
 
-    #final_label_cols = ['Filepath', 'Start Time (s)', 'End Time (s)', 
-    #                    'Low Freq (Hz)', 'High Freq (Hz)', 'Delta Time (s)',
-    #                    'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)', 
-    #                    'Label', 'Type', 'Rating', 'Filename']
-    
-    #valids = valids[final_label_cols]
+    return valid_labels, df_meta  #This isn't what we mean by invalids.  Use the metadata df
 
-    return valids, df_meta, invalids  #This isn't what we mean by invalids.  Use the metadata df
+
+def find_relative_audio_filenames(root: Path) -> list[Path]:
+    """
+    Recursively find all audio files under `root`.
+
+    Returns paths *relative to root*.
+    """
+    AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg", ".aac", ".m4a"}
+    root = root.resolve()
+
+    return [
+        p.relative_to(root)
+        for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
+    ]
+
+
+
+
+
+def validate_filenames(
+    base_dir: Path,
+    list_of_filenames: Sequence[str],
+    purpose: str = "",
+) -> Set[Path]:
+    """
+    Confirm that a list of filenames exist under base_dir.
+
+    Returns:
+        valid_paths: files present both on disk and in the list
+        missing_paths: files referenced in the list but not found on disk
+    """
+
+    base_dir = base_dir.resolve()
+
+    # Files found on disk (relative → absolute → resolved)
+    existing_files = find_relative_audio_filenames(base_dir)
+    existing_paths = {
+        (base_dir / fp).resolve()
+        for fp in existing_files
+    }
+
+    # Files referenced by the dataframe (relative → absolute → resolved)
+    referenced_paths = {
+        (base_dir / fn).resolve()
+        for fn in list_of_filenames
+    }
+
+    missing_paths = referenced_paths - existing_paths
+    extra_files = existing_paths - referenced_paths
+    valid_paths = referenced_paths & existing_paths
+
+    if missing_paths:
+        print(
+            f"[WARNING] {len(missing_paths)} {purpose} file(s) were referenced "
+            f"but not found under {base_dir}. Examples:\n"
+            f"{list(missing_paths)[:3]}\n"
+        )
+
+    if extra_files:
+        print(
+            f"[INFO] {len(extra_files)} file(s) exist under {base_dir} "
+            f"but are not referenced by the {purpose} dataframe. Examples:\n"
+            f"{list(extra_files)[:14]}\n"
+        )
+
+    return {str(p.relative_to(base_dir)) for p in valid_paths}
 
 
 def load_from_anqa(dir_path: Path,
                    metadata_path: Path,
                    labels_path: Path,
                    name_map: Optional[dict] = None):
-    
+
     try:
         df_labels = pd.read_csv(labels_path)
-        print(df_labels.head())
         if len(df_labels) < 1:
             logger.warning('Warning: The labels dataframe is empty')
     except Exception as e:
@@ -241,7 +293,19 @@ def load_from_anqa(dir_path: Path,
         logger.error("Unable to metadata dataframe")
         df_meta = pd.DataFrame()
 
-    return df_labels, df_meta, pd.DataFrame()  #placeholder for invalid rows
+    labels_paths = set(df_labels['Filename'])
+    metadata_paths = set(df_meta['filename'])
+    valid_metadata_fns = validate_filenames(dir_path, metadata_paths, purpose='metadata')
+    valid_label_fns = validate_filenames(dir_path, labels_paths, purpose = 'annotations')
+    valid_names = valid_metadata_fns & valid_label_fns
+
+    df_labels = df_labels[df_labels["Filename"].isin(valid_names)]
+    df_meta = df_meta[df_meta["filename"].isin(valid_names)]
+
+    if name_map is not None:
+        df_labels["Label"] = df_labels["Label"].replace(name_map)
+
+    return df_labels, df_meta
 
 
 def add_missing_label_columns(df):
@@ -262,6 +326,9 @@ def add_missing_label_columns(df):
     for col in text_cols:
         if col not in df.columns:
             df[col] = pd.Series(index=df.index, dtype='string')
+
+    if 'models_used' not in df.columns:
+        df['models_used'] = ['[]' for _ in range(len(df))]
 
     return df
 
@@ -306,24 +373,26 @@ def load_from_birdclef(dir_path: Path,
         df["secondary_labels"] = df["secondary_labels"].apply(rename_list)
 
     df = df.rename(columns={
-    'primary_label': 'Label',
-    'type': 'Type',
-    'rating': 'Rating',
-})
+        'primary_label': 'Label',
+        'type': 'Type',
+        'rating': 'Rating',
+    })
 
     df = add_missing_label_columns(df)
 
-    print(f'After adding the missing labels \n {df.head()}')
-
     # Add a filepath column so we can test existence
     df['filepath'] = df['filename'].apply(lambda p: dir_path / p)
-    mask_exists = df['filepath'].apply(lambda p: p.exists())
+    #mask_exists = df['filepath'].apply(lambda p: p.exists())
 
     # Now format the source_filename and filename columns
     #df['filename'] = #df['Filepath'].apply(lambda x: tail_path(x, depth=2))
     df['source_filename'] = df['filename'] #df['Filepath'].apply(lambda x: tail_path(x, depth=2))
-    df_missing = df[~mask_exists].copy()
-    df = df[mask_exists].copy()
+    
+
+    filenames = set(df['filename'])
+    valid_fns = validate_filenames(dir_path, filenames, purpose='metadata')
+
+    df = df[df["filename"].isin(valid_fns)].copy()
 
     cols_to_move = ['Label', 'Start Time (s)', 'End Time (s)',
                     'Low Freq (Hz)', 'High Freq (Hz)', 'Type', 'Rating']
@@ -333,7 +402,7 @@ def load_from_birdclef(dir_path: Path,
     df_labels['Filepath'] = df['filepath']  # already computed
     df_labels = df_labels[['Filename'] + cols_to_move + ['Filepath']]
 
-    return df_labels, df, df_missing
+    return df_labels, df
 
 
 def validate_name(name: str,
@@ -433,9 +502,6 @@ def load_from_bc_zenodo(data_dir: Union[str, Path],
         label_cols_to_keep = ['filename', 'primary_label', 'secondary_labels', 'Reviewed By',
                               'Reviewed On', 'Filepath', 'Start Time (s)', 'End Time (s)', 
                               'Low Freq (Hz)','High Freq (Hz)', 'Annotation']
-
-
-
 
     dfs, invalid_dfs = [], []
     #for value in tqdm(paired.values()):
@@ -984,7 +1050,7 @@ class ToAnqa:
         final_metadata_cols = ['filename', 'collection', 'secondary_labels', 'url',
                                'latitude', 'longitude', 'author', 'license',
                                'recorded_on', 'reviewed_by', 'reviewed_on',
-                               'source_filename', 'source_start_s', 'source_end_s']
+                               'source_filename', 'source_start_s', 'source_end_s', 'models_used']
         
         for df, cols in zip([self.review_labels, metadata_df],
                             [final_label_cols, final_metadata_cols]):
