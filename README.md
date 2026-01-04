@@ -8,7 +8,7 @@ The package is expected to include:
 * **Plotting** - Plotting tools for work in the above context.
 * **Data** - Methods for sampling and organising wildlife datasets.
 * **Annotation** - Jupyter Notebook based annotation for working with specialised data such as audio crops or tracking card images.
-* **Spatial** - Jupyter Notebook based helper functions for development and visualisation of spatial models for ecology.
+* **Spatial** - Jupyter Notebook based helper functions for development and visualisation of spatial models.
 
 ## Installation
 
