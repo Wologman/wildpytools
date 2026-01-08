@@ -1,18 +1,17 @@
 # WildPyTools
 
-WildPyTools is to be a Python package for developing and analysing wildlife-monitoring statistical and computer vision models.
+WildPyTools is to be a Python package for working with machine learning datasets, models and model outputs, for ecological monitoring.
 
 The package is expected to include:
 
 * **Metrics** - Metrics for evaluating model quality and effectiveness of electronic monitoring methods for ecology.
-* **Plotting** - Plotting tools for work in the above context.
-* **Data** - Methods for sampling and organising wildlife datasets.
-* **Annotation** - Jupyter Notebook based annotation for working with specialised data such as audio crops or tracking card images.
-* **Spatial** - Jupyter Notebook based helper functions for development and visualisation of spatial models.
+* **Plotting Helpers** - Plotting tools for work in the above context.
+* **Data Methods** - Methods for sampling and organising wildlife data such as audio crops and camera trap imagery.
+* **Annotation Methods** - Jupyter Notebook based annotation for working with specialised data such as audio crops or tracking cards.
 
 ## Installation
 
-This package is in early stage development and currently only available from GitHub.
+This package is in early stage development and currently only available from GitHub
 
 ```bash
 git clone https://github.com/wologman/wildpytools.git
