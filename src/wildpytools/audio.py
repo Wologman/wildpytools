@@ -71,6 +71,8 @@ def pair_audio_labels(data_dir: Union[Path,str],
                       match_suffix: str,
                       label_dir: Optional[Union[Path,str]] = None
                       ):
+    
+
     audio_exts = {".wav", ".ogg", ".flac"}
 
     if not isinstance(data_dir, Path):
@@ -558,10 +560,41 @@ def validate_name(name: str,
     return name
 
 
+
+
+def validate_name(
+    name: str,
+    name_map: Optional[dict] = None
+):
+    
+    """
+    Normalise AviaNZ labels and map to eBird names.
+
+    - Removes trailing parenthetical qualifiers (e.g. 'Fantail (Sth Is)')
+    - Applies explicit AviaNZ → eBird mappings
+    - Leaves names unchanged if already valid eBird values
+    """
+    _PARENS_RE = re.compile(r"\s*\(.*?\)\s*$")
+
+    # 1. Strip parenthetical qualifiers (AviaNZ artefacts)
+    clean_name = _PARENS_RE.sub("", name).strip()
+
+    if name_map is not None:
+        name_map = {k.lower(): v for k, v in name_map.items()}
+        mapped_values = set(name_map.values())
+
+        # 2. If already an eBird value, keep it
+        if clean_name not in mapped_values:
+            clean_name = name_map.get(clean_name.lower(), clean_name)
+
+    return clean_name
+
+
 def extract_bird_tags(path_pair: dict,
                       int_to_label: Optional[dict] = None,
                       ):
     audio_path = path_pair['audio']
+    audio_fname = audio_path.name
     label_path = path_pair['labels']
 
     empty = [{
@@ -596,12 +629,13 @@ def extract_bird_tags(path_pair: dict,
                 label = code
 
             records.append({
-                'Filepath' : str(audio_path),
+                'Filename': audio_fname,                
                 'Start Time (s)': start,
                 'End Time (s)': end,
                 'Low Freq (Hz)': freq_low,
                 'High Freq (Hz)': freq_high,
-                'Label': label
+                'Label': label,
+                'Filepath' : str(audio_path),
                 })
             
         df = pd.DataFrame(records)
@@ -612,13 +646,6 @@ def extract_bird_tags(path_pair: dict,
         return label_path.name, pd.DataFrame  # ISSUE #6: Returns pd.DataFrame (class) instead of pd.DataFrame() (empty instance)
 
 
-#def load_from_bc_zenodo(data_dir: Union[str, Path],
-#                        labels_path: Union[str, Path],
-#                        metadata_path: Optional[Union[str, Path]] = None,
-#                        name_map: Optional[dict] = None
-#                        ):
-
-
 def load_from_bc_zenodo(audio_dir: Union[str, Path],
                        metadata_cols: List[str],
                        label_cols: List[str],
@@ -627,16 +654,15 @@ def load_from_bc_zenodo(audio_dir: Union[str, Path],
                        metadata_path: Optional[Union[str, Path]] = None,
                        metadata_dict: Optional[dict] = None,
 ):
-    '''Load Data from post BirdCLEF competition test datasets
+    '''Load Data from BirdCLEF post-competition test datasets
        https://zenodo.org/search?q=birdclef&l=list&p=1&s=10&sort=bestmatch
     '''
 
     audio_dir = Path(audio_dir)
     df_labels = load_dataframe(labels_path, name='labels')
-
-    print(df_labels.head())
-
-    #Need to add filename validation
+    filenames = set(df_labels['Filename'])
+    valid_fns = validate_filenames(audio_dir, filenames, purpose = 'annotations')
+    df_labels = df_labels[df_labels["Filename"].isin(valid_fns)]
     df_labels['Filepath'] = df_labels['Filename'].apply(lambda p: audio_dir / p)
 
     df_labels = df_labels.rename(columns={'Species eBird Code': 'Label'})
@@ -648,48 +674,67 @@ def load_from_bc_zenodo(audio_dir: Union[str, Path],
     return df_labels, df_meta
 
 
+def load_from_freebird(audio_dir: Union[str, Path],
+                       metadata_cols: List[str],
+                       label_cols: List[str],
+                       labels_path: Optional[Union[str, Path]] = None,
+                       rename_map: Optional[dict] = None,
+                       metadata_path: Optional[Union[str, Path]] = None,
+                       metadata_dict: Optional[dict] = None,
+):
+    '''Load from freebird format'''
 
-def load_from_freebird(data_dir: Union[str, Path],
-                   name_map: Optional[dict] = None
-                   ):
-    
-    cols_to_keep = ['Filepath',	'Start Time (s)', 'End Time (s)',	
-                    'Low Freq (Hz)',  'High Freq (Hz)',	'Label']
+    audio_dir = Path(audio_dir)
 
-    if not isinstance(data_dir, Path):
-        data_dir = Path(data_dir)
-
-    paired = pair_audio_labels(data_dir,
+    paired = pair_audio_labels(audio_dir,
                                match_suffix= '.tag',
-                               label_dir=data_dir / '.session')
+                               label_dir=audio_dir / '.session')
 
     dfs, invalid_dfs = [], []
     for value in tqdm(paired.values()):
-        failures, df = extract_bird_tags(value, int_to_label = name_map)
+        failures, df = extract_bird_tags(value, int_to_label = rename_map)
 
         if len(df) > 0:
             #valid_1 = df['Label'].apply(lambda x: isinstance(x, str))  # ISSUE #4: Commented out code - remove if not needed
-            valid_2 = df['Start Time (s)'].apply(lambda x: isinstance(x, (int, float)) and pd.notna(x))
-            valid_3 = df['End Time (s)'].apply(lambda x: isinstance(x, (int, float)) and pd.notna(x))
+            #valid_2 = df['Start Time (s)'].apply(lambda x: isinstance(x, (int, float)) and pd.notna(x))
+            #valid_3 = df['End Time (s)'].apply(lambda x: isinstance(x, (int, float)) and pd.notna(x))
 
-        
             valids = df #[valid_2 & valid_3]  #valid_1 &   # ISSUE #4: Commented out validation - should validate or remove comment
-            errors = df[~valid_2 | ~valid_3] #~valid_1 |  # ISSUE #4: Commented out validation - should validate or remove comment
+            #errors = df[~valid_2 | ~valid_3] #~valid_1 |  # ISSUE #4: Commented out validation - should validate or remove comment
 
             dfs.append(valids)
-            invalid_dfs.append(errors)
+            #invalid_dfs.append(errors)
 
-    valids = combine_dfs(dfs, cols=cols_to_keep)
-    invalids = combine_dfs(invalid_dfs, cols=cols_to_keep)
+    print(dfs[0].head())
 
-    return valids, invalids
+    df_labels = combine_dfs(dfs, cols=label_cols)
+
+    df_meta = build_metadata(metadata_df=None,
+                             metadata_dict=metadata_dict,
+                             valid_labels=df_labels,
+                             metadata_columns=metadata_cols)
+
+    #invalids = combine_dfs(invalid_dfs, cols=label_cols)
+
+    return valids, df_meta           
 
 
-def load_from_avianz(data_dir: Union[str, Path],
-                       name_map: Optional[dict] = None,
-                       max_multibird_length: float = 5,
-                       keep_multibird_labels: bool = True
-                       ):
+#def load_from_avianz(data_dir: Union[str, Path],
+#                       name_map: Optional[dict] = None,
+#                       max_multibird_length: float = 5,
+#                       keep_multibird_labels: bool = True
+#                       ):
+    
+def load_from_avianz(audio_dir: Union[str, Path],
+                     metadata_cols: List[str],
+                     label_cols: List[str],
+                     labels_path: Optional[Union[str, Path]] = None,
+                     rename_map: Optional[dict] = None,
+                     metadata_path: Optional[Union[str, Path]] = None,
+                     metadata_dict: Optional[dict] = None,
+                     keep_multibird_labels: bool = False,
+                     max_multibird_length: float = 2,
+):
     """Converts avenza .data label files, and returns a standardised dataframe
        with the avenza bird names converted to e-bird names.
 
@@ -700,7 +745,7 @@ def load_from_avianz(data_dir: Union[str, Path],
         raven_txt (_type_): filepath as a text string or Path object
     """
 
-    paired = pair_audio_labels(data_dir, '.data')
+    paired = pair_audio_labels(audio_dir, '.data')
     all_records = []
 
     for key in tqdm(paired):
@@ -711,14 +756,30 @@ def load_from_avianz(data_dir: Union[str, Path],
         
         if len(content) <= 1:
             continue
+        # first element:       [{'Operator': 'Mr Bigglesworth', 'Reviewer': 'Dr Evil', 'Duration': 900.0},
+         
+        # second (observations) [    [457.5746179104477, 465.04348955223884, 1230, 2365, 
+        #                           [{'filter': 'M', 'species': 'Weka (spp)', 'certainty': 100}
+        #                       ],
+        #                           [519.0774456521739, 535.3410326086956, 544, 4004,
+        #                           [{"filter": "M", "species": "Kiwi (Great Spotted)", "certainty": 100}]]
+        #                       ]
+        #                       ]
 
-        metadata = content[0]  # first element is metadata
-        observations = content[1:]  # rest are observations
-        
+        metadata = content[0] 
+        author = content[0]['Operator']
+        reviewer = content[0]['Reviewer']
+        observations = content[1:]  
         records = []
+
+        #Boxes must start from observations
+        if author == 'Auto':
+            continue
+
         for obs in observations:
             record = {
                 "Filepath": audio_path,
+                "Filename": audio_path.name,
                 "Start Time (s)": round(obs[0], 1),
                 "End Time (s)": round(obs[1], 1),
                 "Low Freq (Hz)": round(obs[2], 1),
@@ -741,9 +802,9 @@ def load_from_avianz(data_dir: Union[str, Path],
                 continue
 
             if duration <= max_multibird_length:
-                # Multiple short observations allowed
+                # If multiple short observations allowed
                 for bird in bird_list:
-                    species = validate_name(bird.get('species'), name_map)
+                    species = validate_name(bird.get('species'), rename_map)
                     if species is not None:
                         record_copy = record.copy()
                         record_copy['Label'] = species
@@ -751,7 +812,7 @@ def load_from_avianz(data_dir: Union[str, Path],
             else:
                 # Single long observation
                 bird = bird_list[0]
-                species = validate_name(bird.get('species'), name_map)
+                species = validate_name(bird.get('species'), rename_map)
                 if species is not None:
                     record_copy = record.copy()
                     record_copy['Label'] = species
@@ -759,8 +820,16 @@ def load_from_avianz(data_dir: Union[str, Path],
 
         all_records.extend(records)
 
-    df = pd.DataFrame(all_records)
-    return df, None
+    df_labels = pd.DataFrame(all_records)
+
+    print(df_labels.head())
+
+    df_meta = build_metadata(metadata_df=None,
+                             metadata_dict=metadata_dict,
+                             valid_labels=df_labels,
+                             metadata_columns=metadata_cols)
+
+    return df_labels, df_meta
 
 
 def load_audio(path: Path) -> Optional[Tuple[np.ndarray, int]]:
