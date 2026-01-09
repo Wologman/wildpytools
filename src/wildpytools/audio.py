@@ -21,7 +21,7 @@ import soundfile as sf
 import logging
 import re
 import inspect
-from wildpytools.io import load_dataframe
+from wildpytools.io import load_dataframe, extract_recording_datetime, save_dataframe
 
 
 # Set up logger for this module
@@ -192,11 +192,25 @@ def load_from_raven(audio_dir: Union[str, Path],
 
     valid_labels = combine_dfs(dfs, cols=label_cols)
 
-    meta_df = None
+    filepaths = valid_labels['Filepath'].unique().tolist()
     if metadata_path is not None:
-        meta_df = pd.read_csv(metadata_path)
+        df_meta = load_dataframe(metadata_path)
+        mask = df_meta["reviewed_on"].isna()
 
-    df_meta = build_metadata(metadata_df=meta_df,
+        df_meta.loc[mask, "reviewed_on"] = (
+            df.loc[mask, "filepath"]
+            .apply(extract_recording_datetime)
+        )
+
+        df_meta["reviewed_on"] = pd.to_datetime(df_meta["reviewed_on"], errors="coerce")
+    else:
+        meta_records = []
+        for path in filepaths:
+            dt, _ = extract_recording_datetime(path)
+            meta_records.append({'filename': Path(path).name, 'filepath': path, 'recorded_on': dt})
+        df_meta = pd.DataFrame(meta_records)
+
+    df_meta = build_metadata(metadata_df=df_meta,
                              metadata_dict=metadata_dict,
                              valid_labels=valid_labels,
                              metadata_columns=metadata_cols)
@@ -459,16 +473,6 @@ def add_missing_columns(df: pd.DataFrame, check_cols: list):
 
     return df
 
-#'audio_dir', 'labels_path', 'label_cols', 'metadata_cols', 'rename_map', 'metadata_dict'
-
-#def load_from_raven(audio_dir: Union[str, Path],
-#                    metadata_cols: List[str],
-#                    label_cols: List[str],
-#                    labels_path: Optional[Union[str, Path]] = None,
-#                    rename_map: Optional[dict] = None,
-#                    metadata_path: Optional[Union[str, Path]] = None,
-#                    metadata_dict: Optional[dict] = None,
-#                    ):
 
 def load_from_birdclef(audio_dir: Union[str, Path],
                        metadata_cols: List[str],
@@ -666,7 +670,19 @@ def load_from_bc_zenodo(audio_dir: Union[str, Path],
     df_labels['Filepath'] = df_labels['Filename'].apply(lambda p: audio_dir / p)
 
     df_labels = df_labels.rename(columns={'Species eBird Code': 'Label'})
-    df_meta = build_metadata(metadata_df=None,
+
+
+    #update the recorded_on one file at a time
+    #create a dataframe with only filename, filepath, recorded_on populated
+
+    filepaths = df_labels['Filepath'].to_list()
+    meta_records = []
+    for path in filepaths:
+        dt, _ = extract_recording_datetime(path)
+        meta_records.append({'filename': path.name, 'filepath': path, 'recorded_on': dt})
+    df_meta = pd.DataFrame(meta_records)
+
+    df_meta = build_metadata(metadata_df=df_meta,
                              metadata_dict=metadata_dict,
                              valid_labels=df_labels,
                              metadata_columns=metadata_cols)
@@ -705,15 +721,28 @@ def load_from_freebird(audio_dir: Union[str, Path],
             dfs.append(valids)
             #invalid_dfs.append(errors)
 
-    print(dfs[0].head())
-
     df_labels = combine_dfs(dfs, cols=label_cols)
 
-    df_meta = build_metadata(metadata_df=None,
+    filepaths = df_labels['Filepath'].unique().tolist()
+    meta_records = []
+    for path in filepaths:
+        dt, _ = extract_recording_datetime(path)
+        meta_records.append({'filename': Path(path).name, 'filepath': path, 'recorded_on': dt})
+    df_meta = pd.DataFrame(meta_records)
+
+    df_meta = build_metadata(metadata_df=df_meta,
                              metadata_dict=metadata_dict,
                              valid_labels=df_labels,
                              metadata_columns=metadata_cols)
 
+    counts = df_meta['filename'].value_counts()
+    bad = counts[counts > 1]
+    print(bad)
+
+    if not bad.empty:
+        raise ValueError(
+            f"Metadata duplication introduced in build_metadata:\n{bad}"
+        )
     #invalids = combine_dfs(invalid_dfs, cols=label_cols)
 
     return valids, df_meta           
@@ -746,7 +775,8 @@ def load_from_avianz(audio_dir: Union[str, Path],
     """
 
     paired = pair_audio_labels(audio_dir, '.data')
-    all_records = []
+    label_records = []
+    meta_records = []
 
     for key in tqdm(paired):
         label_path = paired[key]['labels']
@@ -765,11 +795,20 @@ def load_from_avianz(audio_dir: Union[str, Path],
         #                           [{"filter": "M", "species": "Kiwi (Great Spotted)", "certainty": 100}]]
         #                       ]
         #                       ]
-
-        metadata = content[0] 
+        
+        date_time, method = extract_recording_datetime(audio_path)
+        #print(date_time)
+        observations = content[1:]
         author = content[0]['Operator']
         reviewer = content[0]['Reviewer']
-        observations = content[1:]  
+        filename = audio_path.name
+        recording_metadata = {'filename': filename,
+                              'filepath': audio_path,
+                              'recorded_on': date_time,
+                              'author': author,
+                              'reviewer': reviewer}
+        meta_records.append(recording_metadata)
+        
         records = []
 
         #Boxes must start from observations
@@ -818,13 +857,13 @@ def load_from_avianz(audio_dir: Union[str, Path],
                     record_copy['Label'] = species
                     records.append(record_copy)
 
-        all_records.extend(records)
+        label_records.extend(records)
 
-    df_labels = pd.DataFrame(all_records)
-
+    df_labels = pd.DataFrame(label_records)
     print(df_labels.head())
+    df_meta = pd.DataFrame(meta_records)
 
-    df_meta = build_metadata(metadata_df=None,
+    df_meta = build_metadata(metadata_df=df_meta,
                              metadata_dict=metadata_dict,
                              valid_labels=df_labels,
                              metadata_columns=metadata_cols)
@@ -943,8 +982,6 @@ def anqa_to_raven_selections(df: pd.DataFrame,
             selections_destn = destn_dir / f'{file_stem}.Table.1.selections.txt'
             group = group[columns_for_raven]
             group.to_csv(selections_destn, sep='\t', index=False)
-
-
 
 
 class SourceDataLoader:
@@ -1405,6 +1442,55 @@ def predictions_to_raven(destn_dir: Union[str, Path],
     #create any empty columns for things like frequency & power density
     #write to a .selections.text file with tabs as the seperator  
     return
+
+
+def merge_anqa_data(root_dir: str | Path,
+                    folder_paths: list[str | Path] | None = None,
+
+    ):
+    '''Merge an arbitrarily large collection of Anqa datasets into a single
+       one, with filepaths set to be relative to the root_dir argument'''
+
+    root_dir = Path(root_dir)
+    if folder_paths is not None:
+        folder_paths = [Path(item) for item in folder_paths]
+    else:
+        folder_paths = [p for p in root_dir.rglob("*") if p.is_dir()]
+
+    # for each ds:
+    def _find_file(folder: Path, stem: str):
+        parquet_name = f'{stem}.parquet'
+        csv_name = f'{stem}.csv'
+        all_files = (p for p in folder.iterdir() if p.is_file())
+
+        if parquet_name in all_files:
+            return folder / parquet_name
+        elif csv_name in all_files:
+            return folder / csv_name
+        else:
+            print(f'Warning, no {stem} file found in {folder}')
+            return None
+
+    meta_dfs = []
+    labels_dfs = []
+    for folder in folder_paths:
+        labels = _find_file(folder, 'annotations')
+        metadata = _find_file(folder, 'metadata')
+        df_labels = load_dataframe(labels)
+        df_meta = load_dataframe(metadata)
+        #   extend the filename & Filename columns
+        #   merge the dataframe
+    
+        meta_dfs.append(df_meta)
+        labels_dfs.append(df_labels)
+
+    #concatenate.
+
+    save_dataframe(df_meta, root_dir, index=False)
+    save_dataframe(df_labels, root_dir, index=False)
+    return
+
+
 
 
 ###############################################################################
