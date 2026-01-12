@@ -218,45 +218,91 @@ def load_from_raven(audio_dir: Union[str, Path],
 
     df_meta = build_metadata(metadata_df=df_meta,
                              metadata_dict=metadata_dict,
-                             valid_labels=valid_labels,
+                             labels_df=valid_labels,
                              metadata_columns=metadata_cols)
 
     return valid_labels, df_meta
+
+
+def _build_file_index(labels_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reduce event-level labels to a validated file-level index.
+
+    Enforces:
+    - One filepath per filename
+    - One filename per filepath
+    - Exactly one row per physical file
+    """
+    df = (
+        labels_df[['Filename', 'Filepath']]
+        .rename(columns={'Filename': 'filename', 'Filepath': 'filepath'})
+    )
+
+    # filename -> filepath must be 1:1
+    path_counts = df.groupby('filename')['filepath'].nunique()
+    bad = path_counts[path_counts > 1]
+    if not bad.empty:
+        raise ValueError(
+            "Filename maps to multiple filepaths:\n"
+            f"{bad}"
+        )
+
+    # filepath -> filename must be 1:1
+    name_counts = df.groupby('filepath')['filename'].nunique()
+    bad = name_counts[name_counts > 1]
+    if not bad.empty:
+        raise ValueError(
+            "Filepath maps to multiple filenames:\n"
+            f"{bad}"
+        )
+
+    return (
+        df
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
 
 
 def build_metadata(
     *,
     metadata_df: Optional[pd.DataFrame],
     metadata_dict: Optional[dict],
-    valid_labels: pd.DataFrame,
+    labels_df: pd.DataFrame,
     metadata_columns: list[str],
 ) -> pd.DataFrame:
+    """
+    Build file-level metadata from event-level labels.
 
-    # 1. Existing metadata
+    Assumptions (enforced):
+    - Labels may contain multiple rows per file
+    - Metadata contains at most one row per file
+    - filename and filepath uniquely identify the same file
+    """
+
+    # 1. Build validated file index from labels
+    df_index = _build_file_index(labels_df)
+
+    # 2. Existing metadata
     if metadata_df is not None and not metadata_df.empty:
         df_existing = metadata_df.copy()
+        if df_existing['filename'].duplicated().any():
+            raise ValueError("metadata_df contains duplicate filenames")
     else:
         df_existing = pd.DataFrame()
 
-    # 2. Build index safely (no parallel sorting)
-    df_index = (
-        valid_labels[['Filename', 'Filepath']]
-        .drop_duplicates()
-        .rename(columns={'Filename': 'filename', 'Filepath': 'filepath'})
-        .reset_index(drop=True)
-    )
-
-    # 3. Merge
+    # 3. Merge metadata (safe by construction)
     if df_existing.empty:
         df_meta = df_index
     else:
         df_meta = df_index.merge(
             df_existing,
             on='filename',
-            how='left'
+            how='left',
+            validate='one_to_one'
         )
 
-    # 4. Ensure source_filename exists
+    # 4. Ensure source_filename exists and is filled
     if 'source_filename' not in df_meta.columns:
         df_meta['source_filename'] = df_meta['filename']
     else:
@@ -270,11 +316,12 @@ def build_metadata(
         for col, value in metadata_dict.items():
             df_meta[col] = value
 
-    # 6. Optional: enforce column order
+    # 6. Enforce column order (optional)
     if metadata_columns:
         df_meta = df_meta.reindex(columns=metadata_columns)
 
     return df_meta
+
 
 
 def find_relative_audio_filenames(root: Path) -> list[Path]:
@@ -380,7 +427,7 @@ def load_from_anqa(audio_dir: Union[str, Path],
 
     df_meta = build_metadata(metadata_df=df_meta,
                              metadata_dict=metadata_dict,
-                             valid_labels=df_labels,
+                             labels_df=df_labels,
                              metadata_columns=metadata_cols)
 
     return df_labels, df_meta
@@ -649,12 +696,12 @@ def extract_bird_tags(path_pair: dict,
 
 
 def load_from_bc_zenodo(audio_dir: Union[str, Path],
-                       metadata_cols: List[str],
-                       label_cols: List[str],
-                       labels_path: Optional[Union[str, Path]] = None,
-                       rename_map: Optional[dict] = None,
-                       metadata_path: Optional[Union[str, Path]] = None,
-                       metadata_dict: Optional[dict] = None,
+                        metadata_cols: List[str],
+                        label_cols: List[str],
+                        labels_path: Optional[Union[str, Path]] = None,
+                        rename_map: Optional[dict] = None,
+                        metadata_path: Optional[Union[str, Path]] = None,
+                        metadata_dict: Optional[dict] = None,
 ):
     '''Load Data from BirdCLEF post-competition test datasets
        https://zenodo.org/search?q=birdclef&l=list&p=1&s=10&sort=bestmatch
@@ -673,7 +720,7 @@ def load_from_bc_zenodo(audio_dir: Union[str, Path],
     #update the recorded_on one file at a time
     #create a dataframe with only filename, filepath, recorded_on populated
 
-    filepaths = df_labels['Filepath'].to_list()
+    filepaths = list(df_labels['Filepath'].unique())
     meta_records = []
     for path in filepaths:
         dt, _ = extract_recording_datetime(path)
@@ -682,7 +729,7 @@ def load_from_bc_zenodo(audio_dir: Union[str, Path],
 
     df_meta = build_metadata(metadata_df=df_meta,
                              metadata_dict=metadata_dict,
-                             valid_labels=df_labels,
+                             labels_df=df_labels,
                              metadata_columns=metadata_cols)
 
     return df_labels, df_meta
@@ -730,7 +777,7 @@ def load_from_freebird(audio_dir: Union[str, Path],
 
     df_meta = build_metadata(metadata_df=df_meta,
                              metadata_dict=metadata_dict,
-                             valid_labels=df_labels,
+                             labels_df=df_labels,
                              metadata_columns=metadata_cols)
 
     counts = df_meta['filename'].value_counts()
@@ -862,7 +909,7 @@ def load_from_avianz(audio_dir: Union[str, Path],
 
     df_meta = build_metadata(metadata_df=df_meta,
                              metadata_dict=metadata_dict,
-                             valid_labels=df_labels,
+                             labels_df=df_labels,
                              metadata_columns=metadata_cols)
     
     #if unknowns:
@@ -910,17 +957,11 @@ def load_from_avianz_simple(audio_dir: Union[str, Path],
 
         # Observations (flat format)
         observations = content[1:]
-        #if audio_path.name == '20190831_183004.wav':
-        #    print(f'the number of observations for {audio_path.name} is {len(observations)}')
-        #    print(observations)
+
         for obs in observations:
             start, end, low, high, labels_list = obs
             label = labels_list[0].get('species')
             score = labels_list[0].get('certainty')/100
-            #if audio_path.name == '20190831_183004.wav':
-            #    print('hello')
-            #    print(f'This is the labels list {labels_list}')
-            #    print(f'The label is: {label}')
 
             record = {
                 "Filename": audio_path.name,
@@ -936,13 +977,11 @@ def load_from_avianz_simple(audio_dir: Union[str, Path],
             label_records.append(record)
 
     df_labels = pd.DataFrame(label_records)
-    #print('Printing the dafaframe filtered for only 20190831_183004.wav')
-    #print(df_labels[(df_labels['Filename'] == '20190831_183004.wav') ])
 
     df_meta = pd.DataFrame(meta_records)
     df_meta = build_metadata(metadata_df=df_meta,
                            metadata_dict=metadata_dict,
-                            valid_labels=df_labels,
+                            labels_df=df_labels,
                             metadata_columns=metadata_cols)
 
     return df_labels, df_meta
@@ -1452,28 +1491,139 @@ class ToAnqa:
         return self.review_labels, metadata_df
 
 
+from pathlib import Path
+import pandas as pd
+
+def reanchor_relative_paths(
+    df: pd.DataFrame,
+    *,
+    filename_col: str,
+    current_root: Path,
+    new_root: Path,
+    strict: bool = True,
+) -> pd.DataFrame:
+    """
+    Re-anchor relative paths in `filename_col` from `current_root`
+    to `new_root`.
+
+    Example:
+        current_root = /.../grandparent/parent
+        new_root     = /.../grandparent
+
+        subfolder/file.wav  ->  parent/subfolder/file.wav
+    """
+
+    current_root = current_root.resolve()
+    new_root = new_root.resolve()
+
+    if strict and not current_root.is_relative_to(new_root):
+        raise ValueError(
+            f"current_root ({current_root}) is not under new_root ({new_root})"
+        )
+
+    def _rewrite(p: str) -> str:
+        abs_path = (current_root / p).resolve()
+        try:
+            rel = abs_path.relative_to(new_root)
+        except ValueError:
+            raise ValueError(
+                f"Path {abs_path} is not under new_root {new_root}"
+            )
+        return rel.as_posix()
+
+    out = df.copy()
+    out[filename_col] = out[filename_col].apply(_rewrite)
+    return out
+
+
+import pandas as pd
+from typing import Iterable
+
+import pandas as pd
+from typing import Iterable, Optional
+
+def concat_dataframes(
+    dfs: Iterable[pd.DataFrame],
+    *,
+    filename_col: str = "filename",
+    enforce_unique_filenames: bool = True,
+    reset_index: bool = True,
+) -> pd.DataFrame:
+    """
+    Concatenate DataFrames with identical columns.
+
+    Parameters
+    ----------
+    dfs : iterable of DataFrame
+        DataFrames to concatenate.
+    filename_col : str
+        Column used for optional uniqueness enforcement.
+    enforce_unique_filenames : bool
+        If True, enforce global uniqueness of filename_col.
+    reset_index : bool
+        If True, reset index after concatenation.
+    """
+
+    dfs = list(dfs)
+    if not dfs:
+        return pd.DataFrame()
+
+    # 1. Validate column equality
+    cols = dfs[0].columns
+    for i, df in enumerate(dfs[1:], start=1):
+        if not df.columns.equals(cols):
+            raise ValueError(
+                f"Column mismatch in dataframe {i}:\n"
+                f"Expected {list(cols)}\n"
+                f"Got      {list(df.columns)}"
+            )
+
+    # 2. Concatenate
+    out = pd.concat(dfs, axis=0, ignore_index=reset_index)
+
+    # 3. Optional uniqueness enforcement
+    if enforce_unique_filenames and filename_col in out.columns:
+        dupes = out[filename_col][out[filename_col].duplicated()]
+        if not dupes.empty:
+            raise ValueError(
+                "Duplicate filenames found after concatenation:\n"
+                f"{dupes.unique()}"
+            )
+
+    return out
+
+
+
 def merge_anqa_data(root_dir: str | Path,
                     folder_paths: list[str | Path] | None = None,
 
     ):
-    '''Merge an arbitrarily large collection of Anqa datasets into a single
-       one, with filepaths set to be relative to the root_dir argument'''
+    '''Merge an arbitrarily large collection of Anqa datasets under the same
+       parent directory into a single one, new relative filepaths from that
+       parent.  Ideally by placing them all directly under the parent and giving
+       each a clear folder name.  Alternatively by supplying a list of specific
+       folder paths (you might need to do this if some sub-folders are to be excluded)
+    '''
 
     root_dir = Path(root_dir)
     if folder_paths is not None:
         folder_paths = [Path(item) for item in folder_paths]
     else:
-        folder_paths = [p for p in root_dir.rglob("*") if p.is_dir()]
+        #note: not recursively searching here
+        folder_paths = [p for p in root_dir.glob("*") if p.is_dir()]
 
     # for each ds:
     def _find_file(folder: Path, stem: str):
         parquet_name = f'{stem}.parquet'
         csv_name = f'{stem}.csv'
-        all_files = (p for p in folder.iterdir() if p.is_file())
+        all_files = [p for p in folder.iterdir() if p.is_file()]
+        all_filenames = [p.name for p in all_files]
 
-        if parquet_name in all_files:
+        if parquet_name in all_filenames:
+            print(f'Loading {folder / stem}.parquet')
             return folder / parquet_name
-        elif csv_name in all_files:
+        elif csv_name in all_filenames:
+            print(f'Loading {folder / stem}.csv')
             return folder / csv_name
         else:
             print(f'Warning, no {stem} file found in {folder}')
@@ -1482,21 +1632,41 @@ def merge_anqa_data(root_dir: str | Path,
     meta_dfs = []
     labels_dfs = []
     for folder in folder_paths:
-        labels = _find_file(folder, 'annotations')
-        metadata = _find_file(folder, 'metadata')
-        df_labels = load_dataframe(labels)
-        df_meta = load_dataframe(metadata)
-        #   extend the filename & Filename columns
-        #   merge the dataframe
+        labels = _find_file(folder=folder, stem='annotations')
+        metadata = _find_file(folder=folder, stem='metadata')
+        df_labels = load_dataframe(labels, name='labels')
+        df_meta = load_dataframe(metadata, name ='metadata')
+
+        df_labels = reanchor_relative_paths(df_labels,
+                                            filename_col='Filename',
+                                            current_root=labels.parent,
+                                            new_root=root_dir,
+                                            strict=True)
+        
+        df_meta = reanchor_relative_paths(df_meta,
+                                          filename_col='filename',
+                                          current_root=labels.parent,
+                                          new_root=root_dir,
+                                          strict=True)
+        
+
     
         meta_dfs.append(df_meta)
         labels_dfs.append(df_labels)
 
-    #concatenate.
+    df_labels = concat_dataframes(labels_dfs,
+                                  enforce_unique_filenames=False,
+                                  reset_index=True)
 
-    save_dataframe(df_meta, root_dir, index=False)
-    save_dataframe(df_labels, root_dir, index=False)
-    return
+    df_meta = concat_dataframes(meta_dfs,
+                                filename_col='filename',
+                                enforce_unique_filenames=True,
+                                reset_index=True,
+                                 )
+
+    save_dataframe(df_meta, root_dir / 'sample_metadata.csv', index=False)
+    save_dataframe(df_labels, root_dir / 'sample_labels.csv', index=False)
+    return df_labels, df_meta
 
 ################################################################################
 ##### Methods for turning model outputs into convenient formats#################
@@ -1508,7 +1678,7 @@ def merge_anqa_data(root_dir: str | Path,
 # It would be best to use a stand alone table with an identifier that matches 
 # the corresponding bounding box identifier, plus a filename identifier.
 
-# Outputs from the processing app:
+# Outputs from the processing app (with option of .paquet instead of .csv):
 # Anqa format for the maximum prediction per bounding box  (max_predictions.csv)
 # Anqa format for with the score for a particular bird per box (kiwi_predictions.csv)
 # Anqa format for the metadata (metadata.csv)
@@ -1550,22 +1720,6 @@ def predictions_to_anqa(df: pd.DataFrame,
     #merge any adjacent rows
 
     return df
-
-
-def predictions_to_raven(destn_dir: Union[str, Path],
-                         anqa_df: pd.DataFrame,
-                         ):
-    """Converts model predictions in anqa format to the tab seperated 
-       .selections.txt files of raven.
-
-    Args:
-        destn_dir (str): a directory path for the .selections.txt files
-        df (pd.DataFrame): dataframe with 5-second presence/absence values
-    """
-    
-    #create any empty columns for things like frequency & power density
-    #write to a .selections.text file with tabs as the seperator  
-    return
 
 
 ###############################################################################
