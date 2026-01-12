@@ -32,15 +32,22 @@ logger = logging.getLogger(__name__)
 ####################Audio format handling #####################################
 ###############################################################################
 '''The idea here is to have a standardised dataframe for soundscapes
-   1. Annotations
-   Filename | Start Time (s) | End Time (s)	| Low Freq (Hz)	| High Freq (Hz) | Label
-   Plus a convenient method to turn this to and from Raven .selections files
+   1. Annotations  
+
+   Filename	| Start Time (s)| End Time (s) | Low Freq (Hz) | High Freq (Hz)	|
+   Label | Type | Sex | Score | Delta Time (s) | Delta Freq (Hz) | 
+   Avg Power Density (dB FS/Hz)
+
+   Columns from other sources like 'rating' and 'confidence' are converted to a
+   score from 0 to 1, to be analogous with model scores.
+
+   Plus a convenient method to turn this to and from Raven .selections.txt files
 
    2. Metadata
-   Using BirdCLEF column names, as default but in principle allowing unlimited extra columns.
-   As a minimum (even if some are empty):
-   | primary_label | secondary_labels | type | filename | collection | rating | url | latitude
-   | longitude | scientific_name | common_name | author | license | reviewed_by | reviewed_on
+   Using BirdCLEF column names, as default with some addional ones :
+   | primary_label | secondary_labels | type | filename | collection | url
+   | latitude | longitude | scientific_name | common_name | author | license
+   | reviewed_by | reviewed_on
 
    Test (and potentially val) performance metrics can be conveniently be run directly
    on these these fixed-length soundscapes, split from training data by location, 
@@ -64,7 +71,6 @@ logger = logging.getLogger(__name__)
 def tail_path(path, depth: int):
     p = Path(path)
     return Path(*p.parts[-depth:]).as_posix()
-
 
 
 def pair_audio_labels(data_dir: Union[Path,str],
@@ -444,7 +450,7 @@ def format_anqa_columns(
 def add_missing_columns(df: pd.DataFrame, check_cols: list):
 
     float_cols = [
-        'Start Time (s)', 'End Time (s)', 'Rating',
+        'Start Time (s)', 'End Time (s)', 'Score',
         'Low Freq (Hz)', 'High Freq (Hz)', 'source_start_s', 'source_end_s'
     ]
     for col in float_cols:
@@ -533,7 +539,7 @@ def load_from_birdclef(audio_dir: Union[str, Path],
         'filepath': 'Filepath',
         'primary_label': 'Label',
         'type': 'Type',
-        'rating': 'Rating'
+        'rating': 'Score'
     })
 
     df_meta = add_missing_columns(df_meta, check_cols=metadata_cols)[metadata_cols]
@@ -542,56 +548,48 @@ def load_from_birdclef(audio_dir: Union[str, Path],
     return df_labels, df_meta
 
 
-def validate_name(name: str,
-                  name_map: Optional[dict] = None
-                  ):
-    """_summary_
-
-    Args:
-        name (str): The name found in the raven file
-        name_map (Optional[dict], optional): mapping to ebird, Defaults to None.
-
-    Returns:
-        string: the e-bird name if original name matches a key, 
-        or it will be left unchanged if found in e-bird values
-    """
-    
-    if name_map is not None:
-        name_map = {k.lower(): v for k, v in name_map.items()}
-        mapped_values = set(name_map.values())
-        if name not in mapped_values:
-            name = name_map.get(name.lower())
-    return name
-
-
-
+import re
+from typing import Optional, Tuple
 
 def validate_name(
     name: str,
-    name_map: Optional[dict] = None
-):
-    
+    name_map: Optional[dict] = None,
+    unknown_value: str = "unknown",
+) -> Tuple[str, Optional[str]]:
     """
     Normalise AviaNZ labels and map to eBird names.
 
-    - Removes trailing parenthetical qualifiers (e.g. 'Fantail (Sth Is)')
-    - Applies explicit AviaNZ → eBird mappings
-    - Leaves names unchanged if already valid eBird values
+    Behaviour
+    ---------
+    - If name_map is None: return cleaned name unchanged
+    - If name_map is provided:
+        * mapped value is used if key exists
+        * otherwise result is 'unknown'
+        * mapping to 'unknown' is also treated as unknown
     """
     _PARENS_RE = re.compile(r"\s*\(.*?\)\s*$")
 
-    # 1. Strip parenthetical qualifiers (AviaNZ artefacts)
     clean_name = _PARENS_RE.sub("", name).strip()
 
-    if name_map is not None:
-        name_map = {k.lower(): v for k, v in name_map.items()}
-        mapped_values = set(name_map.values())
+    # No mapping supplied → passthrough
+    if name_map is None:
+        return clean_name, None
 
-        # 2. If already an eBird value, keep it
-        if clean_name not in mapped_values:
-            clean_name = name_map.get(clean_name.lower(), clean_name)
+    name_map_lc = {k.lower(): v for k, v in name_map.items()}
+    key = clean_name.lower()
 
-    return clean_name
+    # Key missing → unknown
+    if key not in name_map_lc:
+        return unknown_value, name
+
+    resolved_name = name_map_lc[key]
+
+    # Explicitly mapped to unknown
+    if resolved_name.lower() == unknown_value:
+        return unknown_value, name
+
+    return resolved_name, None
+
 
 
 def extract_bird_tags(path_pair: dict,
@@ -748,12 +746,6 @@ def load_from_freebird(audio_dir: Union[str, Path],
     return valids, df_meta           
 
 
-#def load_from_avianz(data_dir: Union[str, Path],
-#                       name_map: Optional[dict] = None,
-#                       max_multibird_length: float = 5,
-#                       keep_multibird_labels: bool = True
-#                       ):
-    
 def load_from_avianz(audio_dir: Union[str, Path],
                      metadata_cols: List[str],
                      label_cols: List[str],
@@ -762,7 +754,6 @@ def load_from_avianz(audio_dir: Union[str, Path],
                      metadata_path: Optional[Union[str, Path]] = None,
                      metadata_dict: Optional[dict] = None,
                      keep_multibird_labels: bool = False,
-                     max_multibird_length: float = 2,
 ):
     """Converts avenza .data label files, and returns a standardised dataframe
        with the avenza bird names converted to e-bird names.
@@ -777,13 +768,13 @@ def load_from_avianz(audio_dir: Union[str, Path],
     paired = pair_audio_labels(audio_dir, '.data')
     label_records = []
     meta_records = []
+    unknowns = []
 
     for key in tqdm(paired):
         label_path = paired[key]['labels']
         audio_path = paired[key]['audio']  # not used here, but you could store it if needed
         with open(label_path, "r") as f:
             content = json.load(f)
-        
         if len(content) <= 1:
             continue
         # first element:       [{'Operator': 'Mr Bigglesworth', 'Reviewer': 'Dr Evil', 'Duration': 900.0},
@@ -798,10 +789,11 @@ def load_from_avianz(audio_dir: Union[str, Path],
         
         date_time, method = extract_recording_datetime(audio_path)
         #print(date_time)
-        observations = content[1:]
+        
         author = content[0]['Operator']
         reviewer = content[0]['Reviewer']
         filename = audio_path.name
+        observations = content[1:]
         recording_metadata = {'filename': filename,
                               'filepath': audio_path,
                               'recorded_on': date_time,
@@ -810,6 +802,7 @@ def load_from_avianz(audio_dir: Union[str, Path],
         meta_records.append(recording_metadata)
         
         records = []
+        
 
         #Boxes must start from observations
         if author == 'Auto':
@@ -828,45 +821,129 @@ def load_from_avianz(audio_dir: Union[str, Path],
             duration = obs[1] - obs[0]
             bird_list = obs[4]
 
-            # Skip if multi-bird and too long
-            if len(bird_list) > 1 and duration > max_multibird_length:
-                continue
-
-            # Skip if bird_list is empty
-            if not bird_list:
-                continue
-
-            # Skip if rejecting all multi-bird labels
-            if len(bird_list) > 1 and not keep_multibird_labels:
-                continue
-
-            if duration <= max_multibird_length:
+            if len(bird_list) > 1 and keep_multibird_labels:
                 # If multiple short observations allowed
                 for bird in bird_list:
-                    species = validate_name(bird.get('species'), rename_map)
+                    species, unknown = validate_name(bird.get('species'), rename_map)
                     if species is not None:
                         record_copy = record.copy()
                         record_copy['Label'] = species
+                        record_copy['Score'] = bird['certainty'] / 100
                         records.append(record_copy)
-            else:
-                # Single long observation
+            elif len(bird_list) > 1:
+                # If multiple observations not allowed
+                if species is not None:
+                    record_copy = record.copy()
+                    record_copy['Label'] = 'unknown'
+                    record_copy['Score'] = 0
+                    records.append(record_copy)
+            elif len(bird_list) == 1:
+                # Single observation
                 bird = bird_list[0]
-                species = validate_name(bird.get('species'), rename_map)
+                species, unknown = validate_name(bird.get('species'), rename_map)
+
                 if species is not None:
                     record_copy = record.copy()
                     record_copy['Label'] = species
                     records.append(record_copy)
 
+            if unknown is not None:
+                unknowns.append(unknown)
+
+            else:
+                continue
+
+            
+
         label_records.extend(records)
 
     df_labels = pd.DataFrame(label_records)
-    print(df_labels.head())
     df_meta = pd.DataFrame(meta_records)
 
     df_meta = build_metadata(metadata_df=df_meta,
                              metadata_dict=metadata_dict,
                              valid_labels=df_labels,
                              metadata_columns=metadata_cols)
+    
+    #if unknowns:
+    print(f"The following Avianz labels were unrecognised or unusable and mapped to 'unknown':\n{unknowns}")
+
+    return df_labels, df_meta
+
+
+def load_from_avianz_simple(audio_dir: Union[str, Path],
+                     metadata_cols: List[str],
+                     label_cols: List[str],
+                     labels_path: Optional[Union[str, Path]] = None,
+                     rename_map: Optional[dict] = None,
+                     metadata_path: Optional[Union[str, Path]] = None,
+                     metadata_dict: Optional[dict] = None,
+                     keep_multibird_labels: bool = False,
+):
+    """Converts avenza .data label files, and returns a standardised dataframe
+       with the avenza bird names converted to e-bird names.
+
+       Any items where multiple birds are asigned by the annotator to the same
+       box are saved as 'unknown'
+
+    Args:
+        raven_txt (_type_): filepath as a text string or Path object
+    """
+
+    paired = pair_audio_labels(audio_dir, '.data')
+    label_records = []
+    meta_records = []
+
+    #print(f'there are {len(paired)} matching wav-label file pairs')
+
+    for key in tqdm(paired):
+        label_path = paired[key]['labels']
+        audio_path = paired[key]['audio']  # not used here, but you could store it if needed
+        with open(label_path, "r") as f:
+            content = json.load(f)
+
+        # Metadata
+        meta = content[0]
+        author = meta.get("Operator")
+        reviewer = meta.get("Reviewer")
+        duration = meta.get("Duration")
+
+        # Observations (flat format)
+        observations = content[1:]
+        #if audio_path.name == '20190831_183004.wav':
+        #    print(f'the number of observations for {audio_path.name} is {len(observations)}')
+        #    print(observations)
+        for obs in observations:
+            start, end, low, high, labels_list = obs
+            label = labels_list[0].get('species')
+            score = labels_list[0].get('certainty')/100
+            #if audio_path.name == '20190831_183004.wav':
+            #    print('hello')
+            #    print(f'This is the labels list {labels_list}')
+            #    print(f'The label is: {label}')
+
+            record = {
+                "Filename": audio_path.name,
+                "Filepath": audio_path,
+                "Start Time (s)": round(start, 1),
+                "End Time (s)": round(end, 1),
+                "Low Freq (Hz)": round(low, 1),
+                "High Freq (Hz)": round(high, 1),
+                "Score": score,
+                "Label": label,
+            }
+
+            label_records.append(record)
+
+    df_labels = pd.DataFrame(label_records)
+    #print('Printing the dafaframe filtered for only 20190831_183004.wav')
+    #print(df_labels[(df_labels['Filename'] == '20190831_183004.wav') ])
+
+    df_meta = pd.DataFrame(meta_records)
+    df_meta = build_metadata(metadata_df=df_meta,
+                           metadata_dict=metadata_dict,
+                            valid_labels=df_labels,
+                            metadata_columns=metadata_cols)
 
     return df_labels, df_meta
 
@@ -962,7 +1039,7 @@ def anqa_to_raven_selections(df: pd.DataFrame,
         default_cols = ['Selection', 'View', 'Channel', 'Begin Time (s)', 'End Time (s)',
                         'Low Freq (Hz)', 'High Freq (Hz)', 'Delta Time (s)',
                         'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)',
-                        'Annotation', 'Sex', 'Type', 'Rating']
+                        'Annotation', 'Sex', 'Type', 'Score']
 
         if not columns_for_raven:
             columns_for_raven = default_cols
@@ -996,7 +1073,7 @@ class SourceDataLoader:
     }
 
     label_cols = ['Filename', 'Start Time (s)', 'End Time (s)', 'Low Freq (Hz)',
-                  'High Freq (Hz)',	'Label', 'Type', 'Sex', 'Rating', 'Delta Time (s)',
+                  'High Freq (Hz)',	'Label', 'Type', 'Sex', 'Score', 'Delta Time (s)',
                   'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)','Filepath']
     
     metadata_cols = ['filename', 'collection', 'secondary_labels', 'url', 'latitude',
@@ -1054,7 +1131,7 @@ class SourceDataLoader:
                            metadata_dict=metadata_dict,
                            rename_map=self.rename_map,
                            )
-        
+
         #What happened to adding missing columns here?
         self.labels = add_missing_columns(df_labels, self.label_cols)
         df_meta = add_missing_columns(df_meta, self.metadata_cols)
@@ -1068,7 +1145,7 @@ class SourceDataLoader:
 class ToAnqa:
 
     label_cols = ['Filename', 'Start Time (s)', 'End Time (s)', 'Low Freq (Hz)',
-                  'High Freq (Hz)',	'Label', 'Type', 'Sex', 'Rating', 'Delta Time (s)',
+                  'High Freq (Hz)',	'Label', 'Type', 'Sex', 'Score', 'Delta Time (s)',
                   'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)'] #,'Filepath'
     
     metadata_cols = ['filename', 'collection', 'secondary_labels', 'url', 'latitude',
@@ -1375,75 +1452,6 @@ class ToAnqa:
         return self.review_labels, metadata_df
 
 
-def predictions_to_annotations(df: pd.DataFrame,
-                               name_map: Optional[dict] = None,
-                               threshold: float = 0.5,
-                               ):
-    """_summary_  # ISSUE #12: Incomplete docstring - should describe what function does
-
-    Args:
-        df (pd.DataFrame): _description_  # ISSUE #12: Incomplete docstring
-        name_map (Optional[dict], optional): _description_. Defaults to None.
-        threshold (float, optional): _description_. Defaults to 0.5.
-
-    Returns:
-        _type_: Another dataframe with aggregated and thresholded predictions
-        using what ever naming scheme was stored in the name_map dictionary
-    """
-    #Placeholder for future implementation
-    #convert name columns with the name_map 
-    #extract start and stop time from the id column
-    #apply binary threshold
-    #split any rows with multiple birds
-    #merge any adjacent rows
-
-    return df
-
-
-def predictions_to_avianz(destn_dir: Union[str, Path],
-                          df: pd.DataFrame,
-                          name_map: Optional[dict] = None,
-                          threshold: float = 0.5,
-                          ):
-    """Takes a dataframe in the csv format used for BirdCLEF and 
-       converts to the .json-like format used by Avenza though with 
-       temporal resolution quantised to 5 seconds.
-
-    Args:
-        destn_path (str): _description_  # ISSUE #12: Parameter name mismatch - docstring says destn_path but parameter is destn_dir
-        df (pd.DataFrame): _description_
-    """
-    annots = predictions_to_annotations(df,
-                                        name_map=name_map,
-                                        threshold=threshold)
-    # Placeholder for future implementation
-    #create any empty columns for things like frequency & power density
-    #json.dump to a .data file
-    return
-
-
-def predictions_to_raven(destn_dir: Union[str, Path],
-                         df: pd.DataFrame,
-                         name_map: Optional[dict] = None,
-                         threshold: float = 0.5,
-                         ):
-    """Converts a dataframe in the format used for BirdCLEF and 
-       to the tab seperated .selections.txt files of raven,
-       with temporal resolution quantised to 5 seconds.
-
-    Args:
-        destn_dir (str): a directory path for the .selections.txt files
-        df (pd.DataFrame): dataframe with 5-second presence/absence values
-    """
-    annots = predictions_to_annotations(df,
-                                        name_map=name_map,
-                                        threshold=threshold)
-    
-    #create any empty columns for things like frequency & power density
-    #write to a .selections.text file with tabs as the seperator  
-    return
-
-
 def merge_anqa_data(root_dir: str | Path,
                     folder_paths: list[str | Path] | None = None,
 
@@ -1490,7 +1498,74 @@ def merge_anqa_data(root_dir: str | Path,
     save_dataframe(df_labels, root_dir, index=False)
     return
 
+################################################################################
+##### Methods for turning model outputs into convenient formats#################
+################################################################################
 
+# Outputs from the model:
+# Scores for each species for each T-F bounding box.
+
+# It would be best to use a stand alone table with an identifier that matches 
+# the corresponding bounding box identifier, plus a filename identifier.
+
+# Outputs from the processing app:
+# Anqa format for the maximum prediction per bounding box  (max_predictions.csv)
+# Anqa format for with the score for a particular bird per box (kiwi_predictions.csv)
+# Anqa format for the metadata (metadata.csv)
+# The extra table with the prediction scores for all classes (all_predictions.csv),
+# Includes identifier to link both the bounding-box and the filename
+
+# Raven visualisations (selectable from a drop-down menu)
+# A raven visualisation with the max bird for each box (equiv of n-minute bird-count)
+# A raven visualisation with a particular bird and it's probability score for each box
+
+# A 1-minute raven visualisation, 1-minute randomly chosen per file, for callibration 
+# or human-in-loop annotation with top-5 predictions
+
+
+def predictions_to_anqa(df: pd.DataFrame,
+                        name_map: Optional[dict] = None,
+                        threshold: Optional[str] = None,
+                        single_species: Optional[List[str]] = None,
+                        ):
+    """Convert the model's predictions dataframe into Anqa Labels format
+       If a single_species is selected then the threshold is applied, all boxes
+       are given that label, and the score for that species is used.
+
+    Args:
+        df (pd.DataFrame): The raw output from the model, with one row per bounding box
+        name_map (Optional[dict], optional): maps model names to final naming system
+        threshold (str, optional): A filtered output will also be produced using the scores
+        single_species (bool, optional): All boxes to be that species with it's model score
+
+    Returns:
+        _type_: A dataframe with the maximum score per bounding box (potentially filtered)
+                A dataframe with the scores for a particular species
+    """
+    #Placeholder for future implementation
+    #convert name columns with the name_map 
+    #extract start and stop time from the id column
+    #apply binary threshold
+    #split any rows with multiple birds
+    #merge any adjacent rows
+
+    return df
+
+
+def predictions_to_raven(destn_dir: Union[str, Path],
+                         anqa_df: pd.DataFrame,
+                         ):
+    """Converts model predictions in anqa format to the tab seperated 
+       .selections.txt files of raven.
+
+    Args:
+        destn_dir (str): a directory path for the .selections.txt files
+        df (pd.DataFrame): dataframe with 5-second presence/absence values
+    """
+    
+    #create any empty columns for things like frequency & power density
+    #write to a .selections.text file with tabs as the seperator  
+    return
 
 
 ###############################################################################
