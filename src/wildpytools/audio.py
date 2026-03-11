@@ -24,6 +24,7 @@ import re
 import inspect
 from wildpytools.io import load_dataframe, extract_recording_datetime, save_dataframe
 from IPython.display import Audio
+from matplotlib.patches import Rectangle
 
 
 # Set up logger for this module
@@ -107,7 +108,6 @@ def pair_audio_labels_not_recursive(data_dir: Union[Path,str],
                 "labels": sel_matches[0]
             }
     return paired
-
 
 
 def pair_audio_labels(
@@ -301,7 +301,6 @@ def _build_file_index(labels_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-
 def build_metadata(
     *,
     metadata_df: Optional[pd.DataFrame],
@@ -359,7 +358,6 @@ def build_metadata(
         df_meta = df_meta.reindex(columns=metadata_columns)
 
     return df_meta
-
 
 
 def find_relative_audio_filenames(root: Path) -> list[Path]:
@@ -707,9 +705,6 @@ def extract_bird_tags(root_dir:  Union[str, Path],
             freq_low = round(float(bird_tag.find('FreqLow').text),1) if bird_tag.find('FreqLow') is not None else None
             freq_high = round(float(bird_tag.find('FreqHigh').text),1) if bird_tag.find('FreqHigh') is not None else None
 
-            if freq_low > freq_high:
-                freq_low, freq_high = freq_high, freq_low
-
             end = None
             if start is not None and duration is not None:
                 end =  start + duration
@@ -723,15 +718,27 @@ def extract_bird_tags(root_dir:  Union[str, Path],
 
             relative_filename = str(audio_path.relative_to(root_dir))
 
-            records.append({
+            low_freq_hz = 16625 - freq_low/2  #correcting the stuffup in freebird
+            high_freq_hz = 16625 - freq_high/2  #correcting the stuffup in freebird
+
+            record = {
                 'Filename': relative_filename,                
                 'Start Time (s)': start,
                 'End Time (s)': end,
-                'Low Freq (Hz)': 16000 - freq_low/2,
-                'High Freq (Hz)': 16000 - freq_high/2,
+                'Low Freq (Hz)': low_freq_hz,
+                'High Freq (Hz)': high_freq_hz,
                 'Label': label,
                 'Filepath' : str(audio_path),
-                })
+                }
+
+            print(f'Low: {low_freq_hz}, High: {high_freq_hz}')
+            if high_freq_hz > 16000:
+                print(f'[Info]: The file {relative_filename} had a frequency value > 16kHz')
+            if low_freq_hz < 0: 
+                print(f'[Info]: The file {relative_filename} had a frequency value < 0kHz')
+            if low_freq_hz >=0 and high_freq_hz <= 16000:
+                print(f'Low: {low_freq_hz}, High: {high_freq_hz}')
+                records.append(record)
         df = pd.DataFrame(records)
 
         if unrecognised_keys:
@@ -804,7 +811,7 @@ def load_from_freebird(audio_dir: Union[str, Path],
 
     dfs, invalid_dfs = [], []
     for value in tqdm(paired.values()):
-        df, failures  = extract_bird_tags(audio_dir, value, int_to_label = rename_map)
+        df, failures  = extract_bird_tags(audio_dir, value, int_to_label = rename_map) #Only returns dfs for valid time-frequency boxes
 
         if len(df) > 0:
             dfs.append(df)
@@ -1003,6 +1010,74 @@ def compute_spectrogram(waveform: np.ndarray | torch.Tensor,
     return power, freqs, times
 
 
+
+## Currently using both of these.  In future try to move to the one below.
+
+def compute_melspec(
+    y: np.ndarray,
+    *,
+    sr: int,
+    n_mels: int = 128,
+    n_fft: int = 1024,
+    hop_length: int | None = None,
+    fmin: float = 0.0,
+    fmax: float | None = None,
+    top_db: float = 80.0,
+    normalize: bool = True,
+) -> np.ndarray:
+    """
+    Compute a normalized log-mel spectrogram.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Audio signal (1D)
+    sr : int
+        Sample rate
+    n_mels : int
+        Number of mel bins
+    n_fft : int
+        FFT size
+    hop_length : int, optional
+        Hop length in samples
+    fmin, fmax : float
+        Frequency range in Hz
+    top_db : float
+        Dynamic range for log scaling
+    normalize : bool
+        Whether to min-max normalize output
+
+    Returns
+    -------
+    S : np.ndarray
+        Mel spectrogram, shape (n_mels, n_frames)
+    """
+
+    y = np.asarray(y, dtype=np.float32)
+
+    if not np.isfinite(y).all():
+        y = np.nan_to_num(y, nan=0.0, posinf=np.max(y), neginf=0.0)
+
+    melspec = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr,
+        n_mels=n_mels,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        fmin=fmin,
+        fmax=fmax,
+        power=2.0,
+    )
+
+    S_db = librosa.power_to_db(melspec, top_db=top_db)
+
+    if normalize:
+        eps = 1e-6
+        S_db = (S_db - S_db.min()) / (S_db.max() - S_db.min() + eps)
+
+    return S_db
+
+
 def avg_power_density(wav: np.ndarray,
                       sr: int,
                       t_start: float,
@@ -1155,7 +1230,7 @@ class SourceDataLoader:
 class ToAnqa:
 
     label_cols = ['Filename', 'Start Time (s)', 'End Time (s)', 'Low Freq (Hz)',
-                  'High Freq (Hz)',	'Label', 'Type', 'Sex', 'Score', 'Delta Time (s)',
+                  'High Freq (Hz)',	'Label', 'Indv ID', 'Type', 'Sex', 'Score', 'Life Stage', 'Delta Time (s)', #, ,
                   'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)'] #,'Filepath'
     
     metadata_cols = ['filename', 'collection', 'secondary_labels', 'url', 'latitude',
@@ -1168,6 +1243,7 @@ class ToAnqa:
                  destn_dir: Union[str, Path],
                  name_map: Optional[dict] = None,
                  save_audio: bool = False,
+                 min_labels: int = 1,
                  max_seconds: int = 60,
                  max_hz: int = 1600,
                  min_hz: int = 0,
@@ -1175,10 +1251,9 @@ class ToAnqa:
                  crop_method: Literal['keep_all', 'bbox'] = 'keep_all', # Future: 'random', 'max_annotations', 'max_detections'
                  default_sr: int = 32000,
                  n_jobs: int = 0,
-                 destn_depth: int = 2,
                  buffer_seconds: float = 0.5,
                  ):
-        
+
         self.source_dir = Path(source_dir)
         self.destn_dir = Path(destn_dir)
         self.audio_destn = self.destn_dir / 'audio'
@@ -1186,6 +1261,7 @@ class ToAnqa:
         self.name_map = name_map
         self.save_audio = save_audio
         self.max_seconds = max_seconds
+        self.min_labels = min_labels
         self.max_hz = max_hz
         self.min_hz = min_hz
         self.end_padding = end_padding
@@ -1195,7 +1271,6 @@ class ToAnqa:
         self.default_sr = default_sr
         self.n_jobs = n_jobs
         self.parallel = False if n_jobs == 0 else True
-        self.destn_depth = destn_depth
         self.buffer_seconds = buffer_seconds
 
         # --- Validation check ---
@@ -1204,6 +1279,13 @@ class ToAnqa:
                 f"`save_audio` cannot be True when `source_dir` and `destn_dir` "
                 f"are the same ({self.source_dir})"
             )
+        
+    def _normalise_datetimes(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convert all datetime columns to ISO 8601 strings for format-agnostic storage."""
+        for col in ['recorded_on', 'reviewed_on']:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                df[col] = df[col].dt.strftime('%Y-%m-%dT%H:%M:%S')
+        return df
 
     def _validate_labels(self, 
                          df: pd.DataFrame,
@@ -1420,7 +1502,10 @@ class ToAnqa:
         """Convert a single file into a raven-compatible slections table and standard length .flac file"""  
         
         try:
-            df = df[self.label_cols].copy()
+            df = df.copy()
+            df['Low Freq (Hz)'] = df['Low Freq (Hz)'].clip(lower=self.min_hz)
+            df['High Freq (Hz)'] = df['High Freq (Hz)'].clip(upper=self.max_hz)    
+
 
             if df_meta is not None:
                 if len(df_meta) != 1:
@@ -1461,12 +1546,15 @@ class ToAnqa:
 
     def convert_all(self, df_labels: pd.DataFrame, df_meta: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Convert all grouped recordings from two DataFrames using different grouping columns."""
+        #print(f'Original length of the labels df')
 
+        df_labels = df_labels[df_labels.groupby("Filename")["Filename"].transform("count") >= self.min_labels]
         grouped_labels = df_labels.groupby('Filename')
         grouped_meta = df_meta.groupby('filename')
 
         # Find filenames that exist in both
         #common_filenames = grouped_labels.groups.keys() & grouped_meta.groups.keys()
+        
         common_filenames = [fname for fname in df_labels['Filename'].unique() if fname in grouped_meta.groups]
 
         # Build a list of (filename, group_from_df1, group_from_df2)
@@ -1505,6 +1593,7 @@ class ToAnqa:
         #Format columns to ensure consistant datatype, order and precision
         self.review_labels = format_anqa_columns(self.review_labels, self.label_cols)
         metadata_df = format_anqa_columns(metadata_df, self.metadata_cols)
+        metadata_df = self._normalise_datetimes(metadata_df)
 
         return self.review_labels, metadata_df
 
@@ -1554,6 +1643,7 @@ def concat_dataframes(
     filename_col: str = "filename",
     enforce_unique_filenames: bool = True,
     reset_index: bool = True,
+    strict: bool = True,
 ) -> pd.DataFrame:
     """
     Concatenate DataFrames with identical columns.
@@ -1568,26 +1658,46 @@ def concat_dataframes(
         If True, enforce global uniqueness of filename_col.
     reset_index : bool
         If True, reset index after concatenation.
+    strict : bool
+        If True (default), raise on column mismatches. If False, add missing
+        columns as empty (NaN) rather than raising.
     """
 
     dfs = list(dfs)
     if not dfs:
         return pd.DataFrame()
 
-    # 1. Validate column equality
+    # 1. Validate or unify columns
     cols = dfs[0].columns
     for i, df in enumerate(dfs[1:], start=1):
         if not df.columns.equals(cols):
-            raise ValueError(
-                f"Column mismatch in dataframe {i}:\n"
-                f"Expected {list(cols)}\n"
-                f"Got      {list(df.columns)}"
-            )
+            if strict:
+                raise ValueError(
+                    f"Column mismatch in dataframe {i}:\n"
+                    f"Expected {list(cols)}\n"
+                    f"Got      {list(df.columns)}"
+                )
+            else:
+                all_cols = list(dict.fromkeys(col for df in dfs for col in df.columns))
+                dfs = [
+                    df.reindex(columns=all_cols)
+                    if not df.columns.equals(pd.Index(all_cols))
+                    else df
+                    for df in dfs
+                ]
+                break
 
     # 2. Concatenate
     out = pd.concat(dfs, axis=0, ignore_index=reset_index)
 
-    # 3. Optional uniqueness enforcement
+    # 3. Turn any accidental numpy arrays back into lists of strings
+    for col in out.columns:
+        if out[col].dtype == object:
+            out[col] = out[col].apply(
+                lambda x: str(x) if isinstance(x, (np.ndarray, list)) else x
+            )
+
+    # 4. Optional uniqueness enforcement
     if enforce_unique_filenames and filename_col in out.columns:
         dupes = out[filename_col][out[filename_col].duplicated()]
         if not dupes.empty:
@@ -1599,9 +1709,12 @@ def concat_dataframes(
     return out
 
 
+
+
 def merge_anqa_data(root_dir: str | Path,
                     folder_paths: list[str | Path] | None = None,
                     save_as_parquet: bool = False,
+                    strict: bool = True,
 
     ):
     '''Merge an arbitrarily large collection of Anqa datasets under the same
@@ -1610,6 +1723,15 @@ def merge_anqa_data(root_dir: str | Path,
        each a clear folder name.  Alternatively by supplying a list of specific
        folder paths (you might need to do this if some sub-folders are to be excluded)
     '''
+
+    label_cols = ['Filename', 'Start Time (s)', 'End Time (s)', 'Low Freq (Hz)',
+                  'High Freq (Hz)',	'Label', 'Indv ID', 'Type', 'Sex', 'Score', 'Life Stage', 'Delta Time (s)', #, ,
+                  'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)'] #,'Filepath'
+    
+    metadata_cols = ['filename', 'collection', 'secondary_labels', 'url', 'latitude',
+                     'longitude', 'author', 'license', 'recorded_on', 'reviewed_by', 
+                     'reviewed_on', 'source_filename', 'source_start_s', 'source_end_s',
+                     'models_used']
 
     root_dir = Path(root_dir)
     if folder_paths is not None:
@@ -1637,6 +1759,14 @@ def merge_anqa_data(root_dir: str | Path,
 
     meta_dfs = []
     labels_dfs = []
+
+    def _normalise_datetimes(df: pd.DataFrame) -> pd.DataFrame:
+        """Convert all datetime columns to ISO 8601 strings for format-agnostic storage."""
+        for col in ['recorded_on', 'reviewed_on']:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                df[col] = df[col].dt.strftime('%Y-%m-%dT%H:%M:%S')
+        return df
+
     for folder in folder_paths:
         labels = _find_file(folder=folder, stem='annotations')
         metadata = _find_file(folder=folder, stem='metadata')
@@ -1653,24 +1783,32 @@ def merge_anqa_data(root_dir: str | Path,
                                           current_root=labels.parent,
                                           new_root=root_dir)
         
-
+        df_meta = _normalise_datetimes(df_meta)
     
         meta_dfs.append(df_meta)
         labels_dfs.append(df_labels)
 
     df_labels = concat_dataframes(labels_dfs,
                                   enforce_unique_filenames=False,
-                                  reset_index=True)
+                                  reset_index=True,
+                                  strict=False)
 
     df_meta = concat_dataframes(meta_dfs,
                                 filename_col='filename',
                                 enforce_unique_filenames=True,
                                 reset_index=True,
-                                 )
+                                strict=False,
+                                )
+    
+    df_labels = df_labels.reindex(columns=label_cols)
+    df_meta = df_meta.reindex(columns=metadata_cols)
+
     suffix = 'parquet' if save_as_parquet else 'csv'
+
     save_dataframe(df_meta, root_dir / f'metadata.{suffix}', index=False)
     save_dataframe(df_labels, root_dir / f'annotations.{suffix}', index=False)
     return df_labels, df_meta
+
 
 ################################################################################
 ##### Methods for turning model outputs into convenient formats#################
@@ -1976,83 +2114,136 @@ def play_one_label(row: pd.Series, parent_dir: Path):
     return Audio(data=sample, rate=sr_abe)
 
 
-def show_audio_labels(filename: str, records: list[dict], parent_dir: Path):
-    '''Accepts a list of dictionaries from an Anqa dataset and plots
-    a spectrogram with all the bounding boxes'''
-    #if len(records) == 0:
-    #    raise ValueError("records list is empty")
+def show_audio_labels(
+    filename: str,
+    records: list[dict],
+    parent_dir: Path,
+    audio_cfg: dict | None = None,
+):
+    """
+    Plot a mel spectrogram (as seen by the network) with annotation boxes.
 
-    # All records must refer to the same file
-    filenames = {r['Filename'] for r in records}
-    if len(filenames) > 1:
-        raise ValueError("All records must have the same Filename")
+    Parameters
+    ----------
+    filename : str
+        Audio file name
+    records : list of dict
+        Each dict must contain:
+        - Start Time (s)
+        - End Time (s)
+        - Low Freq (Hz)
+        - High Freq (Hz)
+        - Label
+    parent_dir : Path
+        Root directory for audio files
+    audio_cfg : dict, optional
+        Spectrogram parameters. Missing keys fall back to defaults.
+    """
 
-    #filename = filenames.pop()
+    # --- Defaults + override ---
+
+    DEFAULT_AUDIO_CFG = dict(
+    SR=32000,
+    N_MELS=128,
+    N_FFT=1024,
+    HOP_LENGTH=512,
+    FMIN=0.0,
+    FMAX=None,   # interpreted as sr/2
+    )
+
+    cfg = DEFAULT_AUDIO_CFG.copy()
+    if audio_cfg is not None:
+        cfg.update(audio_cfg)
+
+    # --- Load audio ---
     filepath = parent_dir / filename
-
-    print(f"Showing {len(records)} labels for file: {filename}")
-
-    # Load full audio
-    audio_abe, sr_abe = torchaudio.load(str(filepath))
+    audio_abe, sr = torchaudio.load(str(filepath))
     audio = audio_abe.numpy().squeeze(0)
 
-    duration_s = audio.shape[0] / sr_abe
-    print(f"Audio duration: {duration_s:.2f}s")
+    if cfg["FMAX"] is None:
+        cfg["FMAX"] = sr / 2
 
-    # Compute spectrogram over full file
-    spec_transform = torchaudio.transforms.Spectrogram(
-        n_fft=1024,
-        hop_length=512,
+    # --- Mel spectrogram ---
+    S = librosa.feature.melspectrogram(
+        y=audio,
+        sr=sr,
+        n_mels=cfg["N_MELS"],
+        n_fft=cfg["N_FFT"],
+        hop_length=cfg["HOP_LENGTH"],
+        fmin=cfg["FMIN"],
+        fmax=cfg["FMAX"],
         power=2.0
     )
-    spec = spec_transform(torch.from_numpy(audio))
-    spec_db = 10 * torch.log10(spec + 1e-10)
+    S_db = librosa.power_to_db(S, top_db=80)
 
-    # Axes
-    n_frames = spec_db.shape[1]
-    time_axis = np.linspace(0, duration_s, n_frames)
+    n_mels, n_frames = S_db.shape
 
-    n_freqs = spec_db.shape[0]
-    freq_axis = np.linspace(0, sr_abe / 2, n_freqs)
+    # --- Mel bin centre frequencies (Hz) ---
+    mel_centres_hz = librosa.mel_frequencies(
+        n_mels=n_mels,
+        fmin=cfg["FMIN"],
+        fmax=cfg["FMAX"]
+    )
 
-    # Plot spectrogram
-    plt.figure(figsize=(12, 5))
-    plt.imshow(
-        spec_db.numpy(),
+    # --- Plot ---
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    im = ax.imshow(
+        S_db,
         origin="lower",
         aspect="auto",
-        extent=[time_axis[0], time_axis[-1], freq_axis[0], freq_axis[-1]],
         cmap="magma"
     )
-    plt.colorbar(label="dB")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Frequency (Hz)")
-    plt.title(f"Spectrogram with labels — {filename}")
+    plt.colorbar(im, ax=ax, label="dB")
 
-    from matplotlib.patches import Rectangle
+    # --- Y axis (Hz labels, mel geometry) ---
+    n_yticks = 8
+    yticks = np.linspace(0, n_mels - 1, n_yticks).astype(int)
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([f"{mel_centres_hz[i]:.0f}" for i in yticks])
+    ax.set_ylabel("Frequency (Hz)")
 
-    # Overlay each label
+    # --- X axis (seconds) ---
+    n_xticks = 6
+    xticks = np.linspace(0, n_frames - 1, n_xticks).astype(int)
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(
+        [f"{(i * cfg['HOP_LENGTH'] / sr):.1f}" for i in xticks]
+    )
+    ax.set_xlabel("Time (s)")
+
+    ax.set_title(f"Mel spectrogram + labels — {filename}")
+
+    # --- Coordinate transforms ---
+    def time_to_frame(t):
+        return t * sr / cfg["HOP_LENGTH"]
+
+    def hz_to_mel_bin(f):
+        return np.interp(f, mel_centres_hz, np.arange(n_mels))
+
+    # --- Draw boxes ---
+ 
+
     for rec in records:
-        start_s = rec["Start Time (s)"]
-        end_s = rec["End Time (s)"]
-        low_f = rec["Low Freq (Hz)"]
-        high_f = rec["High Freq (Hz)"]
-        label = rec["Label"]
+        t0 = time_to_frame(rec["Start Time (s)"])
+        t1 = time_to_frame(rec["End Time (s)"])
+        f0 = hz_to_mel_bin(rec["Low Freq (Hz)"])
+        f1 = hz_to_mel_bin(rec["High Freq (Hz)"])
 
         rect = Rectangle(
-            (start_s, low_f),
-            end_s - start_s,
-            high_f - low_f,
+            (t0, f0),
+            t1 - t0,
+            f1 - f0,
             linewidth=2,
             edgecolor="cyan",
             facecolor="none"
         )
-        plt.gca().add_patch(rect)
+        ax.add_patch(rect)
 
-        plt.text(
-            start_s,
-            high_f,
-            label,
+        ax.text(
+            t0,
+            f1,
+            rec["Label"],
             color="cyan",
             fontsize=8,
             verticalalignment="bottom"
@@ -2061,5 +2252,5 @@ def show_audio_labels(filename: str, records: list[dict], parent_dir: Path):
     plt.tight_layout()
     plt.show()
 
-    # Return full-file audio player
-    return Audio(data=audio, rate=sr_abe)
+    return Audio(data=audio, rate=sr)
+
