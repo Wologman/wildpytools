@@ -731,13 +731,11 @@ def extract_bird_tags(root_dir:  Union[str, Path],
                 'Filepath' : str(audio_path),
                 }
 
-            print(f'Low: {low_freq_hz}, High: {high_freq_hz}')
             if high_freq_hz > 16000:
                 print(f'[Info]: The file {relative_filename} had a frequency value > 16kHz')
             if low_freq_hz < 0: 
                 print(f'[Info]: The file {relative_filename} had a frequency value < 0kHz')
             if low_freq_hz >=0 and high_freq_hz <= 16000:
-                print(f'Low: {low_freq_hz}, High: {high_freq_hz}')
                 records.append(record)
         df = pd.DataFrame(records)
 
@@ -871,9 +869,20 @@ def load_from_avianz(audio_dir: Union[str, Path],
     for key in tqdm(paired):
         label_path = paired[key]['labels']
         audio_path = paired[key]['audio']  # not used here, but you could store it if needed
+        
+        
+        
         with open(label_path, "r") as f:
-            content = json.load(f)
-        if len(content) <= 1:
+            text = f.read().strip()
+
+        if not text:
+            print(f"Skipping empty JSON: {label_path}")
+            continue
+
+        try:
+            content = json.loads(text)
+        except json.JSONDecodeError:
+            print(f"Invalid JSON: {label_path}")
             continue
         
         date_time, method = extract_recording_datetime(audio_path)
@@ -1252,6 +1261,7 @@ class ToAnqa:
                  default_sr: int = 32000,
                  n_jobs: int = 0,
                  buffer_seconds: float = 0.5,
+                 max_segments: int | None = None,
                  ):
 
         self.source_dir = Path(source_dir)
@@ -1272,6 +1282,7 @@ class ToAnqa:
         self.n_jobs = n_jobs
         self.parallel = False if n_jobs == 0 else True
         self.buffer_seconds = buffer_seconds
+        self.max_segments = max_segments
 
         # --- Validation check ---
         if self.save_audio and self.source_dir == self.destn_dir:
@@ -1319,23 +1330,28 @@ class ToAnqa:
         return df    
 
     def save_one_segment(self, segment: dict):
-        file_stem = Path(segment['filename']).stem
         if self.save_audio:
-            destn = self.audio_destn / f'{file_stem}.flac'
+            destn = self.audio_destn / segment['rel_path']
+            destn.parent.mkdir(parents=True, exist_ok=True)
+
             wav = segment['wave']
             if segment['sr'] != self.default_sr:
                 num_samples = int(len(wav) * self.default_sr / segment['sr'])
                 wav = resample(wav, num_samples)
+
             sf.write(destn, wav, self.default_sr)
 
 
-    def segment_audio(self,
-                      wav: np.ndarray,
-                      sr: int,
-                      filename: str, 
-                      label_df: pd.DataFrame,
-                      meta_dict: dict,
-                      min_remainder_length_sec: float = 1):
+    def segment_audio(
+        self,
+        wav: np.ndarray,
+        sr: int,
+        filename: str,
+        label_df: pd.DataFrame,
+        meta_dict: dict,
+        parent_rel: Path = Path(),   # NEW
+        min_remainder_length_sec: float = 1
+    ):
         """Break up longer audio files into fixed-length segments,
         optionally pad shorter ones, and adjust label times accordingly.
         The remainder from any non-whole segments will be discarded if less
@@ -1355,6 +1371,7 @@ class ToAnqa:
         max_seconds = self.max_seconds
         end_padding = self.end_padding
         crop_method = self.crop_method
+        max_segments = self.max_segments
         segment_length = int(max_seconds * sr)
         wav_length = len(wav)
         original_len_secs = wav_length // sr
@@ -1391,6 +1408,9 @@ class ToAnqa:
         num_segments, remainder = compute_num_segments(wav_length,
                                                        segment_length,
                                                        sr*min_remainder_length_sec)
+        
+        if max_segments is not None:
+            num_segments = min(num_segments, max_segments)
 
         # --- Optional padding step for final segment ---
         if remainder != 0 and end_padding is not None:
@@ -1453,9 +1473,15 @@ class ToAnqa:
             #a unique id to the filename
             ###########################################################################3####
             unique_id = f'{id}_' if crop_method == 'bbox' else '_'
-            seg_fname = f"{clean_stem}{unique_id}from_{int(ref_start_time)}.flac" #for save destn
+            #seg_fname = f"{clean_stem}{unique_id}from_{int(ref_start_time)}.flac" #for save destn
             #col_fname = tail_path(str(seg_fname),depth=self.destn_depth) #for csv
-            col_fname = (self.destn_dir / 'audio' / seg_fname).relative_to(self.destn_dir).as_posix()
+            #col_fname = (self.destn_dir / 'audio' / seg_fname).relative_to(self.destn_dir).as_posix()
+            seg_fname = f"{clean_stem}{unique_id}from_{int(ref_start_time)}.flac"
+
+            # Canonical relative path (used everywhere)
+            rel_path =  parent_rel / seg_fname
+            col_fname = rel_path.as_posix()
+
             seg_meta_dict = base_meta.copy()
             seg_meta_dict['filename'] = col_fname
             seg_meta_dict['source_start_s'] = f'{ref_start_time:.1f}'
@@ -1488,19 +1514,26 @@ class ToAnqa:
             seg_df['Delta Freq (Hz)'] = seg_df['High Freq (Hz)'] - seg_df['Low Freq (Hz)']
 
             segments.append({
-                    "filename": seg_fname,
-                    "wave": segment_wav,
-                    "sr": sr,
-                    "labels_df": seg_df,
-                    "meta_dict": seg_meta_dict,
-                })
+                "rel_path": rel_path,
+                "wave": segment_wav,
+                "sr": sr,
+                "labels_df": seg_df,
+                "meta_dict": seg_meta_dict,
+            })
 
         return segments
 
 
-    def convert_one_file(self, filename: str, df: pd.DataFrame, df_meta: pd.DataFrame) -> list[dict]:
+    def convert_one_file(
+                        self,
+                        filename: str,
+                        df: pd.DataFrame,
+                        df_meta: pd.DataFrame,
+                        keep_parent_folder: bool = False
+                    ) -> list[dict]:
         """Convert a single file into a raven-compatible slections table and standard length .flac file"""  
-        
+        source_path = Path(filename)
+        parent_rel = source_path.parent if keep_parent_folder else Path()
         try:
             df = df.copy()
             df['Low Freq (Hz)'] = df['Low Freq (Hz)'].clip(lower=self.min_hz)
@@ -1511,6 +1544,9 @@ class ToAnqa:
                 if len(df_meta) != 1:
                     raise ValueError(f"Unexpected duplicate metadata rows for {df_meta.iloc[0].get('filename')}, {len(df_meta)} rows found")
                 meta_dict = df_meta.iloc[0].to_dict()
+                # Ensure source_filename is populated from existing filename
+                if 'source_filename' not in meta_dict or pd.isna(meta_dict['source_filename']):
+                    meta_dict['source_filename'] = meta_dict.get('filename')
 
             wav, sr = load_audio(self.source_dir / filename)
 
@@ -1520,7 +1556,7 @@ class ToAnqa:
 
             if self.save_audio:
                 # Consume the generator one segment at a time
-                for segment in self.segment_audio(wav, sr, filename, df, meta_dict):
+                for segment in self.segment_audio(wav, sr, filename, df, meta_dict, parent_rel=parent_rel):
                     self.save_one_segment(segment)
                     
                     # IMPORTANT: Extract what we need for the CSV, then let the 'wave' die
@@ -1544,7 +1580,12 @@ class ToAnqa:
         return None 
 
 
-    def convert_all(self, df_labels: pd.DataFrame, df_meta: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def convert_all(
+        self,
+        df_labels: pd.DataFrame,
+        df_meta: pd.DataFrame,
+        keep_parent_folder: bool = False
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Convert all grouped recordings from two DataFrames using different grouping columns."""
         #print(f'Original length of the labels df')
 
@@ -1562,14 +1603,14 @@ class ToAnqa:
 
         if self.parallel:
             results = Parallel(n_jobs=self.n_jobs)(
-                delayed(self.convert_one_file)(fname, labels, metadata)
+                delayed(self.convert_one_file)(fname, labels, metadata, keep_parent_folder)
                 for fname, labels, metadata in tqdm(groups, desc="Converting recordings")
             )
         else:
             results = [
-                self.convert_one_file(fname, labels, metadata)
-                for fname, labels, metadata in tqdm(groups, desc="Converting recordings")
-            ]
+                        self.convert_one_file(fname, labels, metadata, keep_parent_folder)
+                        for fname, labels, metadata in tqdm(groups, desc="Converting recordings")
+                        ]
 
         results = [r for r in results if r is not None]
 
@@ -1637,6 +1678,68 @@ def reanchor_relative_paths(
     return out
 
 
+
+SCHEMA = {
+    "filename": "object",
+    "collection": "object",
+    "primary_label": 'object',
+    "secondary_labels": "object",   # important: keep as object
+    "url": "object",
+    "latitude": "float64",
+    "longitude": "float64",
+    "author": "object",
+    "license": "object",
+    "recorded_on": "object",
+    "reviewed_by": "object",
+    "reviewed_by": "object",
+    "source_filename": "object",
+    "source_start_s": "object",
+    "source_end_s": "object",
+    "length_s": "float64",
+    "models_used": "object",
+    
+    "Filename": "object",
+    "Start Time (s)": "float64",
+    "End Time (s)": "float64",
+    "Low Freq (Hz)": "float64",
+    "High Freq (Hz)": "float64",
+    "Indv ID": "object",
+    "Type": "object",
+    "Sex": "object",
+    "Score": "float64",
+    "Life Stage": "object",
+    "Delta Time (s)": "float64",
+    "Delta Freq (Hz)": "float64",
+    "Avg Power Density (dB FS/Hz)": "float64",
+    "Label": "object",   
+    }
+	
+
+def normalize_to_schema(df, schema):
+    # 1. Ensure all columns exist
+    df = df.reindex(columns=schema.keys())
+
+    # 2. Normalize problematic cell types BEFORE dtype casting
+    def normalize_cell(x):
+        if isinstance(x, np.ndarray):
+            return x.tolist()   # or tuple(x) if you prefer hashable
+        return x
+
+    for col in df.columns:
+        if schema[col] == "object":
+            df[col] = df[col].map(normalize_cell)
+
+    # 3. Enforce dtypes
+    for col, dtype in schema.items():
+        try:
+            df[col] = df[col].astype(dtype)
+        except Exception:
+            # fallback: keep as object if coercion fails
+            df[col] = df[col].astype("object")
+
+    return df
+
+
 def concat_dataframes(
     dfs: Iterable[pd.DataFrame],
     *,
@@ -1644,6 +1747,7 @@ def concat_dataframes(
     enforce_unique_filenames: bool = True,
     reset_index: bool = True,
     strict: bool = True,
+    schema: dict = SCHEMA,
 ) -> pd.DataFrame:
     """
     Concatenate DataFrames with identical columns.
@@ -1666,6 +1770,8 @@ def concat_dataframes(
     dfs = list(dfs)
     if not dfs:
         return pd.DataFrame()
+    
+    dfs = [normalize_to_schema(df, schema) for df in dfs]
 
     # 1. Validate or unify columns
     cols = dfs[0].columns
@@ -1710,11 +1816,10 @@ def concat_dataframes(
 
 
 
-
 def merge_anqa_data(root_dir: str | Path,
                     folder_paths: list[str | Path] | None = None,
                     save_as_parquet: bool = False,
-                    strict: bool = True,
+                    grouped_files = True,
 
     ):
     '''Merge an arbitrarily large collection of Anqa datasets under the same
@@ -1725,12 +1830,12 @@ def merge_anqa_data(root_dir: str | Path,
     '''
 
     label_cols = ['Filename', 'Start Time (s)', 'End Time (s)', 'Low Freq (Hz)',
-                  'High Freq (Hz)',	'Label', 'Indv ID', 'Type', 'Sex', 'Score', 'Life Stage', 'Delta Time (s)', #, ,
-                  'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)'] #,'Filepath'
+                  'High Freq (Hz)',	'Label', 'Indv ID', 'Type', 'Sex', 'Score', 'Life Stage', 'Delta Time (s)',
+                  'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)'] 
     
-    metadata_cols = ['filename', 'collection', 'secondary_labels', 'url', 'latitude',
+    metadata_cols = ['filename', 'collection', 'primary_label', 'secondary_labels', 'url', 'latitude',
                      'longitude', 'author', 'license', 'recorded_on', 'reviewed_by', 
-                     'reviewed_on', 'source_filename', 'source_start_s', 'source_end_s',
+                     'reviewed_on', 'source_filename', 'source_start_s', 'source_end_s', 'length_s',
                      'models_used']
 
     root_dir = Path(root_dir)
@@ -1760,12 +1865,38 @@ def merge_anqa_data(root_dir: str | Path,
     meta_dfs = []
     labels_dfs = []
 
+    def _prefix_audio_root(df: pd.DataFrame, col: str) -> pd.DataFrame:
+        df = df.copy()
+
+        def transform(x):
+            if pd.isna(x):
+                return x
+
+            p = Path(x)
+            parts = p.parts
+
+            # Guard: already inserted
+            if len(parts) > 1 and parts[1] == 'audio':
+                return p.as_posix()
+
+            if len(parts) == 0:
+                return x
+
+            # Insert 'audio' after first component
+            new_path = Path(parts[0]) / 'audio' / Path(*parts[1:])
+            return new_path.as_posix()
+
+        df[col] = df[col].apply(transform)
+        return df
+
     def _normalise_datetimes(df: pd.DataFrame) -> pd.DataFrame:
         """Convert all datetime columns to ISO 8601 strings for format-agnostic storage."""
         for col in ['recorded_on', 'reviewed_on']:
             if pd.api.types.is_datetime64_any_dtype(df[col]):
                 df[col] = df[col].dt.strftime('%Y-%m-%dT%H:%M:%S')
         return df
+    
+
 
     for folder in folder_paths:
         labels = _find_file(folder=folder, stem='annotations')
@@ -1782,6 +1913,10 @@ def merge_anqa_data(root_dir: str | Path,
                                           filename_col='filename',
                                           current_root=labels.parent,
                                           new_root=root_dir)
+        
+        if grouped_files:
+            df_labels = _prefix_audio_root(df_labels, 'Filename')
+            df_meta = _prefix_audio_root(df_meta, 'filename')
         
         df_meta = _normalise_datetimes(df_meta)
     
@@ -2222,7 +2357,6 @@ def show_audio_labels(
         return np.interp(f, mel_centres_hz, np.arange(n_mels))
 
     # --- Draw boxes ---
- 
 
     for rec in records:
         t0 = time_to_frame(rec["Start Time (s)"])
