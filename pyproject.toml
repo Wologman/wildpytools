@@ -7,7 +7,30 @@ authors = [
   { name = "Olly Powell", email = "olly@wekaresearch.com" }
 ]
 dependencies = [
-  "numpy",
-  "pandas"
+  "librosa",
+  "pydub==0.25.1",
+  "numpy < 2",
+  "pandas",
+  "tqdm",
+  "ipython",
+  "jupyter",
+  "matplotlib",
+  "plotly",
+  "plotly_express",
+  "scipy",
+  "scikit-learn",
+  "scikit-image",
+  "seaborn",
+  "opencv",
+  "python-kaleido",
+  "fastparquet",
+  "pyarrow",
+  "piexif",
+  "pyyaml",
+  "pysoundfile",
+  "pyproj",
+  "geopandas",
+  "contextily",
+  "mutagen",
 ]
 requires-python = ">=3.9"
