@@ -1,8 +1,9 @@
 import pandas as pd
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict
 import json
 from typing import Optional, Union, Sequence, Literal, Tuple, Set, List, Iterable
+import re
 import xml.etree.ElementTree as ET
 from tqdm import tqdm
 import IPython.display as ipd
@@ -20,11 +21,11 @@ from typing import Literal
 from joblib import Parallel, delayed
 import soundfile as sf
 import logging
-import re
 import inspect
 from wildpytools.io import load_dataframe, extract_recording_datetime, save_dataframe
 from IPython.display import Audio
 from matplotlib.patches import Rectangle
+from scipy.signal import resample,  butter, sosfiltfilt
 
 
 # Set up logger for this module
@@ -76,44 +77,13 @@ def tail_path(path, depth: int):
     return Path(*p.parts[-depth:]).as_posix()
 
 
-def pair_audio_labels_not_recursive(data_dir: Union[Path,str],
-                      match_suffix: str,
-                      label_dir: Optional[Union[Path,str]] = None
-                      ):
-    
-
-    audio_exts = {".wav", ".ogg", ".flac"}
-
-    if not isinstance(data_dir, Path):
-        data_dir = Path(data_dir)
-    if label_dir:
-        if not isinstance(label_dir, Path):
-            label_dir = Path(label_dir)
-    else:
-        label_dir = data_dir
-
-    paired = {}
-    for audio_file in tqdm(data_dir.iterdir()):
-        if audio_file.suffix.lower() not in audio_exts:
-            continue
-
-        base = audio_file.stem  # e.g. "120401_07"
-
-        # Find all selection files that start with this base and end with .selections.txt
-        sel_matches = list(label_dir.glob(f"{base}*{match_suffix}"))
-
-        if sel_matches:
-            paired[base] = {
-                "audio": audio_file,
-                "labels": sel_matches[0]
-            }
-    return paired
 
 
 def pair_audio_labels(
     data_dir: Union[Path, str],
     match_suffix: str,
     label_dir: Optional[Union[Path, str]] = None,
+    base_from_parent: bool = False,  # Use the parent dir as the base of the filename & label
 ):
     audio_exts = {".wav", ".ogg", ".flac"}
 
@@ -123,24 +93,35 @@ def pair_audio_labels(
     # Recursively collect all label files once
     label_files = list(label_dir.rglob(f"*{match_suffix}"))
 
+    if base_from_parent:
+        # Label files live one level below the audio file's parent, in a
+        # sub-directory of any name (e.g. ".session", "labels", etc).
+        # Index by that sub-directory's parent, since that's what lines up
+        # with audio_file.parent.
+        labels_by_dir: dict[Path, list[Path]] = defaultdict(list)
+        for lf in label_files:
+            labels_by_dir[lf.parent.parent].append(lf)
+
     paired = {}
 
     for audio_file in tqdm(data_dir.rglob("*")):
         if audio_file.suffix.lower() not in audio_exts:
             continue
 
-        base = audio_file.stem  # e.g. "120401_07"
+        if base_from_parent:
+            base = audio_file.parent.name + "/" + audio_file.stem
+            rel_dir = audio_file.parent.relative_to(data_dir)
+            candidates = labels_by_dir.get(label_dir / rel_dir, [])
+        else:
+            base = audio_file.stem
+            candidates = label_files
 
-        # Find matching label files
-        matches = [
-            lf for lf in label_files
-            if lf.name.startswith(base)
-        ]
+        matches = [lf for lf in candidates if lf.name.startswith(audio_file.stem)]
 
         if matches:
             paired[base] = {
                 "audio": audio_file,
-                "labels": matches[0],  # preserve first-match behavior
+                "labels": matches[0],
             }
 
     return paired
@@ -301,12 +282,15 @@ def _build_file_index(labels_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+
+
 def build_metadata(
     *,
     metadata_df: Optional[pd.DataFrame],
     metadata_dict: Optional[dict],
     labels_df: pd.DataFrame,
     metadata_columns: list[str],
+    keep_unlabelled: bool = False,
 ) -> pd.DataFrame:
     """
     Build file-level metadata from event-level labels.
@@ -315,6 +299,10 @@ def build_metadata(
     - Labels may contain multiple rows per file
     - Metadata contains at most one row per file
     - filename and filepath uniquely identify the same file
+
+    If keep_unlabelled is True, files present in metadata_df but absent from
+    labels_df (e.g. no tag file at all) are retained as metadata-only rows
+    rather than being dropped.
     """
 
     # 1. Build validated file index from labels
@@ -324,9 +312,19 @@ def build_metadata(
     if metadata_df is not None and not metadata_df.empty:
         df_existing = metadata_df.copy()
         if df_existing['filename'].duplicated().any():
-            raise ValueError("metadata_df contains duplicate filenames")
+            raise ValueError("metadata_df contains duplicate filenames", metadata_df['filename'])
     else:
         df_existing = pd.DataFrame()
+
+    # 2b. Fold in metadata-only files (no labels at all) if requested
+    if keep_unlabelled and not df_existing.empty:
+        unlabelled_filenames = set(df_existing['filename']) - set(df_index['filename'])
+        if unlabelled_filenames:
+            extra_index = df_existing.loc[
+                df_existing['filename'].isin(unlabelled_filenames),
+                [c for c in ('filename', 'filepath') if c in df_existing.columns]
+            ].copy()
+            df_index = pd.concat([df_index, extra_index], ignore_index=True)
 
     # 3. Merge metadata (safe by construction)
     if df_existing.empty:
@@ -358,6 +356,7 @@ def build_metadata(
         df_meta = df_meta.reindex(columns=metadata_columns)
 
     return df_meta
+
 
 
 def find_relative_audio_filenames(root: Path) -> list[Path]:
@@ -545,7 +544,8 @@ def add_missing_columns(df: pd.DataFrame, check_cols: list):
         if col in check_cols and col not in df.columns:
             df[col] = pd.Series(pd.NA, index=df.index, dtype='datetime64[ns]')
 
-    text_cols = ['reviewed_by', 'Type', 'Sex', 'licence', 'author']
+    text_cols = ['primary_label', 'reviewed_by', 'Type', 'Sex',
+                 'licence', 'author', 'guano']
     for col in text_cols:
         if col in check_cols and col not in df.columns:
             df[col] = pd.Series(pd.NA, index=df.index, dtype='string')
@@ -594,10 +594,7 @@ def load_from_birdclef(audio_dir: Union[str, Path],
 
     dir_path = Path(audio_dir)
     
-    df = load_dataframe(
-        metadata_path,
-        name="metadata"
-    )
+    df = pd.read_csv(metadata_path, low_memory=False)
 
     filenames = set(df['filename'])
     valid_fns = validate_filenames(dir_path, filenames, purpose='metadata')
@@ -631,8 +628,7 @@ def load_from_birdclef(audio_dir: Union[str, Path],
     return df_labels, df_meta
 
 
-import re
-from typing import Optional, Tuple
+
 
 def validate_name(
     name: str,
@@ -731,12 +727,12 @@ def extract_bird_tags(root_dir:  Union[str, Path],
                 'Filepath' : str(audio_path),
                 }
 
-            if high_freq_hz > 16000:
-                print(f'[Info]: The file {relative_filename} had a frequency value > 16kHz')
-            if low_freq_hz < 0: 
-                print(f'[Info]: The file {relative_filename} had a frequency value < 0kHz')
-            if low_freq_hz >=0 and high_freq_hz <= 16000:
-                records.append(record)
+            #if high_freq_hz > 16000:
+            #    print(f'[Info]: The file {relative_filename} had a frequency value > 16kHz')
+            #if low_freq_hz < 0: 
+            #    print(f'[Info]: The file {relative_filename} had a frequency value < 0kHz')
+            #if low_freq_hz >=0 and high_freq_hz <= 16000:
+            records.append(record)
         df = pd.DataFrame(records)
 
         if unrecognised_keys:
@@ -755,6 +751,7 @@ def load_from_bc_zenodo(audio_dir: Union[str, Path],
                         rename_map: Optional[dict] = None,
                         metadata_path: Optional[Union[str, Path]] = None,
                         metadata_dict: Optional[dict] = None,
+                        keep_unlabelled: bool = True
 ):
     '''Load Data from BirdCLEF post-competition test datasets
        https://zenodo.org/search?q=birdclef&l=list&p=1&s=10&sort=bestmatch
@@ -789,44 +786,112 @@ def load_from_bc_zenodo(audio_dir: Union[str, Path],
 
 
 def load_from_freebird(audio_dir: Union[str, Path],
-                       metadata_cols: List[str],
-                       label_cols: List[str],
-                       labels_path: Optional[Union[str, Path]] = None,
-                       rename_map: Optional[dict] = None,
-                       metadata_path: Optional[Union[str, Path]] = None,
-                       metadata_dict: Optional[dict] = None,
-):
-    '''Load from freebird format'''
+    metadata_cols: List[str],
+    label_cols: List[str],
+    labels_path: Optional[Union[str, Path]] = None,
+    rename_map: Optional[dict] = None,
+    metadata_path: Optional[Union[str, Path]] = None,
+    metadata_dict: Optional[dict] = None,
+    keep_unlabelled: bool = True,
+    ):
+    '''Load from freebird format historically used by the Department of Conservation (New Zealand),
+       If keep_unlabelled is true, then for an entry that lacks any labels no label entries are added
+       to the labels dataframe, but a row is still made in the metadata dataframe'''
 
     audio_dir = Path(audio_dir)
-    print(f'This is the audio dir {audio_dir}')
+
+    ################################################################################################
+    ################################################################################################
+    ####This is fragile,  there could be more than one wav_path with the same stem under the audio_dir
+    ################################################################################################
+    ################################################################################################
+
+    # This is specific for the directory structure for Freebird, so pretty fragile.  
+    # Hopefully freebird will be mothballed so this will never be used again 
+    wav_paths = {p.parent.name + p.stem: p for p in audio_dir.rglob('*.wav')}
+    tag_files = {p.parent.parent.name + p.stem for p in audio_dir.rglob('*.tag')}
+    unmatched_wav_stems = set(wav_paths) - tag_files
+    unmatched_wav_paths = {val for key, val in wav_paths.items() if key in unmatched_wav_stems}
+    unmatched_tags = tag_files - set(wav_paths)
+    print(f"[load_from_freebird] found {len(wav_paths)} wav, {len(tag_files)} tag files")
+    print(f"[load_from_freebird] wav with no matching tag: {len(unmatched_wav_paths)}")
+    print(f"[load_from_freebird] tag with no matching wav: {len(unmatched_tags)}")
 
     paired = pair_audio_labels(audio_dir,
-                               match_suffix= '.tag',
-                               label_dir=None)  #Don't use a value unless there's only a single dir involved  audio_dir / '.session'
-    
-    print(f'These are the paired values {paired}')
+        match_suffix='.tag',
+        label_dir=None,
+        base_from_parent=True)
+
+    print(f"[load_from_freebird] pair_audio_labels returned {len(paired)} pairs "
+          f"(vs {len(wav_paths)} wavs on disk)")
 
     dfs, invalid_dfs = [], []
-    for value in tqdm(paired.values()):
-        df, failures  = extract_bird_tags(audio_dir, value, int_to_label = rename_map) #Only returns dfs for valid time-frequency boxes
+    n_empty = 0
+    failure_reasons = []
+    empty_wavs = []
+    for key, value in tqdm(paired.items()):
+        df, failures = extract_bird_tags(audio_dir, value, int_to_label=rename_map)
+
+        if failures:
+            failure_reasons.append((key, failures))
 
         if len(df) > 0:
             dfs.append(df)
+        else:
+            n_empty += 1
+            empty_wavs.append(value['audio']) #appends the audio file path
+
+    print(f"[load_from_freebird] {len(dfs)}/{len(paired)} pairs yielded non-empty tag dataframes")
+    print(f"[load_from_freebird] {n_empty} pairs produced an EMPTY dataframe (0 valid boxes)")
+    print(f"[load_from_freebird] {len(failure_reasons)} pairs reported failures from extract_bird_tags")
+    if failure_reasons:
+        for key, failures in failure_reasons[:5]:
+            print(f"    e.g. {key}: {failures}")
 
     df_labels = combine_dfs(dfs, cols=label_cols)
 
     filepaths = df_labels['Filepath'].unique().tolist()
+    print(f"[load_from_freebird] {len(filepaths)} unique filepaths  in labels after combine_dfs "
+          f"(from {len(dfs)} contributing pairs)")
+
     meta_records = []
     for path in filepaths:
         dt, _ = extract_recording_datetime(path)
-        meta_records.append({'filename': Path(path).name, 'filepath': path, 'recorded_on': dt})
-    df_meta = pd.DataFrame(meta_records)
+        rel_fname = Path(path).parent.name + '/' + Path(path).name
+        meta_records.append({'filename': rel_fname, 'filepath': path, 'recorded_on': dt})
 
-    df_meta = build_metadata(metadata_df=df_meta,
-                             metadata_dict=metadata_dict,
-                             labels_df=df_labels,
-                             metadata_columns=metadata_cols)
+    if keep_unlabelled and unmatched_wav_paths:
+        print(f"[load_from_freebird] keep_unlabelled=True: adding {len(unmatched_wav_paths)} "
+              f"untagged wavs to metadata_df (pre-build_metadata) with no label rows")
+        for unmatched_path in unmatched_wav_paths:
+            dt, _ = extract_recording_datetime(str(unmatched_path))
+            rel_fname = Path(unmatched_path).parent.name + '/' + Path(unmatched_path).name
+
+            #print(f'The relative filename is {rel_fname}')
+            meta_records.append({'filename': rel_fname, 'filepath': str(unmatched_path), 'recorded_on': dt})
+
+    if empty_wavs:
+        print(f"[load_from_freebird] adding {len(empty_wavs)} "
+              f"labbelled but empty wavs to metadata_df (pre-build_metadata) with no label rows")
+        for empty_path in empty_wavs:
+            dt, _ = extract_recording_datetime(str(empty_path))
+            rel_fname = Path(empty_path).parent.name + '/' + Path(empty_path).name
+
+            #print(f'The relative filename is {rel_fname}')
+            meta_records.append({'filename': rel_fname, 'filepath': str(empty_path), 'recorded_on': dt})
+
+    df_meta_pre = pd.DataFrame(meta_records)
+
+    df_meta = build_metadata(metadata_df=df_meta_pre,
+        metadata_dict=metadata_dict,
+        labels_df=df_labels,
+        metadata_columns=metadata_cols,
+        keep_unlabelled=keep_unlabelled,
+        )
+
+    print(f"[load_from_freebird] {len(df_meta)} rows after build_metadata "
+          f"(started from {len(meta_records)} meta_records, "
+          f"{len(unmatched_wav_paths) if keep_unlabelled else 0} of which were untagged)")
 
     counts = df_meta['filename'].value_counts()
     bad = counts[counts > 1]
@@ -835,7 +900,8 @@ def load_from_freebird(audio_dir: Union[str, Path],
             f"Metadata duplication introduced in build_metadata:\n{bad}"
         )
 
-    return df_labels, df_meta           
+    return df_labels, df_meta
+
 
 
 def load_from_avianz(audio_dir: Union[str, Path],
@@ -846,12 +912,10 @@ def load_from_avianz(audio_dir: Union[str, Path],
                      metadata_path: Optional[Union[str, Path]] = None,
                      metadata_dict: Optional[dict] = None,
                      keep_multibird_labels: bool = False,
+                     keep_unlabelled: bool = True,
 ):
     """Converts avenza .data label files, and returns a standardised dataframe
        with the avenza bird names converted to e-bird names.
-
-       Rejects any items > max_length with more than a single bird
-       Otherwise trims the box to max_length with rms sampling to localise the calls
 
     Args:
         raven_txt (_type_): filepath as a text string or Path object
@@ -967,23 +1031,41 @@ def load_from_avianz(audio_dir: Union[str, Path],
         for key, count in counts.items():
             print(f"{key}: {count}")
 
+    #print('The df_labels in the load function, \n', df_labels.head() )
+    #print('The df_meta in the load function, \n', df_meta.head() )
+
     return df_labels, df_meta
 
 
 def load_audio(path: Path) -> Optional[Tuple[np.ndarray, int]]:
     try:
-        wav, sr = librosa.load(path, sr=None)  # returns mono NumPy array
+        wav, sr = librosa.load(path, sr=None, mono=False)  # preserve channels explicitly
     except Exception as e:
-        logger.error(f"The file '{path.name}' failed to load: {e}")
-        return None
+        #logger.error(f"The file '{path.name}' failed to load: {e}")
+        print(f"The file '{path.name}' failed to load: {e}")
+        return None, None
 
     if wav.size == 0:
-        logger.warning(f"The file '{path.name}' is empty and will be skipped.")
-        return None
+        #logger.warning(f"The file '{path.name}' is empty and will be skipped.")
+        print(f"The file '{path.name}' is empty and will be skipped.")
+        return None, None
 
     if sr is None or sr <= 0:
-        logger.warning(f"The file '{path.name}' has an invalid sampling rate ({sr}) and will be skipped.")
-        return None
+        l#ogger.warning(f"The file '{path.name}' has an invalid sampling rate ({sr}) and will be skipped.")
+        print(f"The file '{path.name}' has an invalid sampling rate ({sr}) and will be skipped.")
+        return None, None
+
+    # --- Enforce mono explicitly ---
+    if wav.ndim == 2:
+        # librosa returns (channels, samples)
+        wav = np.mean(wav, axis=0)
+
+    # --- Final sanity ---
+    wav = np.asarray(wav, dtype=np.float32)
+
+    if not np.isfinite(wav).all():
+        wav = np.nan_to_num(wav)
+
     return wav, sr
 
 
@@ -1166,15 +1248,15 @@ class SourceDataLoader:
                   'High Freq (Hz)',	'Label', 'Type', 'Sex', 'Score', 'Delta Time (s)',
                   'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)','Filepath']
     
-    metadata_cols = ['filename', 'collection', 'secondary_labels', 'url', 'latitude',
-                     'longitude', 'author', 'license', 'recorded_on', 'reviewed_by', 
-                     'reviewed_on', 'source_filename', 'source_start_s', 'source_end_s',
-                     'models_used']
+    metadata_cols = ['filename', 'collection', 'primary_label', 'secondary_labels', 
+                     'url', 'latitude', 'longitude', 'author', 'license', 'recorded_on', 
+                     'reviewed_by', 'reviewed_on', 'source_filename', 'source_sr_khz',
+                     'source_start_s','source_end_s', 'source_device', 'models_used', 'guano']
 
     @staticmethod
     def _validate_loader(func):
         expected = {'audio_dir', 'metadata_cols', 'label_cols', 'labels_path',
-                    'metadata_path', 'metadata_dict', 'rename_map'}
+                    'metadata_path', 'metadata_dict', 'rename_map', 'keep_unlabelled'}
         params = inspect.signature(func).parameters
         missing = expected - params.keys()
         if missing:
@@ -1194,6 +1276,7 @@ class SourceDataLoader:
         self,
         source_type: str,
         rename_map: Optional[dict] = None,
+        verbose: bool = True,
     ):
         if source_type not in self.source_loaders:
             raise ValueError(f"Unknown source_type: {source_type}")
@@ -1202,6 +1285,7 @@ class SourceDataLoader:
         self.loader = self.source_loaders[source_type]
         self.rename_map = rename_map
         self._validate_loader(self.loader)
+        self.verbose = verbose
 
     def load_data(
         self,
@@ -1210,12 +1294,13 @@ class SourceDataLoader:
         labels_path: Optional[Union[Path, str]] = None,
         metadata_path: Optional[Union[Path, str]] = None,
         metadata_dict: Optional[dict] = None,
+        keep_unlabelled: bool | None = None,
         ):
 
-        
-        print(f'These are the label cols: {self.label_cols}')
-        print(f'These are the metadata cols: {self.metadata_cols}')
-        print(f'This is the rename map: {self.rename_map}')
+        if self.verbose: 
+            print(f'These are the label cols: {self.label_cols}')
+            print(f'These are the metadata cols: {self.metadata_cols}')
+            print(f'This is the rename map: {self.rename_map}')
 
         df_labels, df_meta = self.loader(audio_dir,
                            label_cols=self.label_cols,
@@ -1224,6 +1309,7 @@ class SourceDataLoader:
                            metadata_path=metadata_path,
                            metadata_dict=metadata_dict,
                            rename_map=self.rename_map,
+                           keep_unlabelled=keep_unlabelled,
                            )
 
         #What happened to adding missing columns here?
@@ -1242,10 +1328,10 @@ class ToAnqa:
                   'High Freq (Hz)',	'Label', 'Indv ID', 'Type', 'Sex', 'Score', 'Life Stage', 'Delta Time (s)', #, ,
                   'Delta Freq (Hz)', 'Avg Power Density (dB FS/Hz)'] #,'Filepath'
     
-    metadata_cols = ['filename', 'collection', 'secondary_labels', 'url', 'latitude',
-                     'longitude', 'author', 'license', 'recorded_on', 'reviewed_by', 
-                     'reviewed_on', 'source_filename', 'source_start_s', 'source_end_s',
-                     'models_used']
+    metadata_cols = ['filename', 'collection', 'primary_label', 'secondary_labels', 
+                     'url', 'latitude', 'longitude', 'author', 'license', 'recorded_on', 
+                     'reviewed_by', 'reviewed_on', 'source_filename', 'source_sr_khz',
+                     'source_start_s','source_end_s', 'source_device', 'models_used']
     
     def __init__(self,
                  source_dir: Union[str, Path],
@@ -1253,11 +1339,13 @@ class ToAnqa:
                  name_map: Optional[dict] = None,
                  save_audio: bool = False,
                  min_labels: int = 1,
-                 max_seconds: int = 60,
+                 require_labels: bool = True,
+                 max_seconds: float = 60,
+                 min_seconds: float = 2,
                  max_hz: int = 1600,
                  min_hz: int = 0,
                  end_padding: Literal['pad', 'noise', 'zero', None] = None,
-                 crop_method: Literal['keep_all', 'bbox'] = 'keep_all', # Future: 'random', 'max_annotations', 'max_detections'
+                 crop_method: Literal['keep_all', 'bbox', 'no_crop'] = 'keep_all', # Future: 'random', 'max_annotations', 'max_detections'
                  default_sr: int = 32000,
                  n_jobs: int = 0,
                  buffer_seconds: float = 0.5,
@@ -1271,11 +1359,15 @@ class ToAnqa:
         self.name_map = name_map
         self.save_audio = save_audio
         self.max_seconds = max_seconds
+        self.min_seconds = min_seconds
         self.min_labels = min_labels
         self.max_hz = max_hz
         self.min_hz = min_hz
         self.end_padding = end_padding
-        self.crop_method = crop_method
+        self.require_labels = require_labels
+        self.crop_method = crop_method 
+        if self.crop_method in ['bbox'] and not self.require_labels:
+            raise ValueError(f'require_labels must be false for crop method {self.crop_method}')
         self.audio = None
         self.results = {}
         self.default_sr = default_sr
@@ -1283,6 +1375,7 @@ class ToAnqa:
         self.parallel = False if n_jobs == 0 else True
         self.buffer_seconds = buffer_seconds
         self.max_segments = max_segments
+        
 
         # --- Validation check ---
         if self.save_audio and self.source_dir == self.destn_dir:
@@ -1347,8 +1440,8 @@ class ToAnqa:
         wav: np.ndarray,
         sr: int,
         filename: str,
-        label_df: pd.DataFrame,
         meta_dict: dict,
+        label_df: pd.DataFrame | None = None,
         parent_rel: Path = Path(),   # NEW
         min_remainder_length_sec: float = 1
     ):
@@ -1367,7 +1460,6 @@ class ToAnqa:
             return max(1, num), remainder
         
         buffer_idx = self.buffer_seconds * sr
-        label_df = label_df.copy()
         max_seconds = self.max_seconds
         end_padding = self.end_padding
         crop_method = self.crop_method
@@ -1395,10 +1487,12 @@ class ToAnqa:
         clean_stem = re.sub(r"_from_\d+$", "", file_stem) if segmented_previously else file_stem
         
         # Fill default boxes to the whole clip
-        label_df['Start Time (s)'] = label_df['Start Time (s)'].fillna(0.0)
-        label_df['End Time (s)'] = label_df['End Time (s)'].fillna(round(original_len_secs, 1)) #no point including the padding
-        label_df['Low Freq (Hz)'] = label_df['Low Freq (Hz)'].fillna(0).astype(float)
-        label_df['High Freq (Hz)'] = label_df['High Freq (Hz)'].fillna(16000).astype(float)
+        if label_df is not None:
+            label_df = label_df.copy()
+            label_df['Start Time (s)'] = label_df['Start Time (s)'].fillna(0.0)
+            label_df['End Time (s)'] = label_df['End Time (s)'].fillna(round(original_len_secs, 1)) #no point including the padding
+            label_df['Low Freq (Hz)'] = label_df['Low Freq (Hz)'].fillna(0).astype(float)
+            label_df['High Freq (Hz)'] = label_df['High Freq (Hz)'].fillna(16000).astype(float)
 
         # Need to identify any previous crops from the source
         # Then calculate the start times as per the various possible cropping schemes
@@ -1445,6 +1539,8 @@ class ToAnqa:
                 start_idx = i * segment_length
                 end_idx = min((i+1) * segment_length, len(wav))
                 seg_idxs.append((start_idx, end_idx))
+        elif crop_method == 'no_crop':
+            seg_idxs.append((0, wav_length))
         else:
             start_idx = np.random.choice(wav_length - segment_length)
             end_idx = start_idx + segment_length
@@ -1452,6 +1548,7 @@ class ToAnqa:
 
         segments = []
         base_meta = meta_dict.copy() if meta_dict is not None else {}
+        seg_df = None
 
         for id, idxs in enumerate(seg_idxs):
             start_idx = idxs[0]
@@ -1459,10 +1556,11 @@ class ToAnqa:
             start_time = start_idx / sr
             end_time = end_idx / sr
             #Take only rows where the label overlaps with that segment
-            seg_df = label_df[
-                    (label_df["Start Time (s)"] < end_time) &
-                    (label_df["End Time (s)"] > start_time)
-                ].copy()
+            if label_df is not None:
+                seg_df = label_df[
+                        (label_df["Start Time (s)"] < end_time) &
+                        (label_df["End Time (s)"] > start_time)
+                    ].copy()
 
             ref_start_time = start_time + offset
             ref_end_time = end_time + offset
@@ -1476,7 +1574,11 @@ class ToAnqa:
             #seg_fname = f"{clean_stem}{unique_id}from_{int(ref_start_time)}.flac" #for save destn
             #col_fname = tail_path(str(seg_fname),depth=self.destn_depth) #for csv
             #col_fname = (self.destn_dir / 'audio' / seg_fname).relative_to(self.destn_dir).as_posix()
-            seg_fname = f"{clean_stem}{unique_id}from_{int(ref_start_time)}.flac"
+
+            if self.crop_method == 'no_crop':
+                seg_fname = f"{clean_stem}.flac"
+            else:
+                seg_fname = f"{clean_stem}{unique_id}from_{int(ref_start_time)}.flac"
 
             # Canonical relative path (used everywhere)
             rel_path =  parent_rel / seg_fname
@@ -1487,31 +1589,51 @@ class ToAnqa:
             seg_meta_dict['source_start_s'] = f'{ref_start_time:.1f}'
             seg_meta_dict['source_end_s'] = f'{ref_end_time:.1f}'
 
-            seg_df["Filename"] = col_fname
-            seg_df["Start Time (s)"] -= start_time 
-            seg_df["End Time (s)"] -= start_time
-            seg_df["Start Time (s)"] = seg_df["Start Time (s)"].clip(lower=0)
-            seg_df["End Time (s)"] = seg_df["End Time (s)"].clip(lower=0, upper=(end_time - start_time))
+            if seg_df is not None:
+                seg_df["Filename"] = col_fname
+                seg_df["Start Time (s)"] -= start_time 
+                seg_df["End Time (s)"] -= start_time
+                seg_df["Start Time (s)"] = seg_df["Start Time (s)"].clip(lower=0)
+                seg_df["End Time (s)"] = seg_df["End Time (s)"].clip(lower=0, upper=(end_time - start_time))
 
-            segment_wav = wav[start_idx:end_idx]
-            seg_df = self._validate_labels(seg_df, wav, sr)
-            power_results = []
+                segment_wav = wav[start_idx:end_idx]
 
-            for idx, row in seg_df.iterrows():
-                power = avg_power_density(
-                        segment_wav,
-                        sr,
-                        float(row["Start Time (s)"]),
-                        float(row["End Time (s)"]),
-                        float(row["Low Freq (Hz)"]),
-                        float(row["High Freq (Hz)"]),
-                    )
-                power_results.append(power)
+                # Skip segments that are too short
+                seg_duration = (end_idx - start_idx) / sr
+                if seg_duration < self.min_seconds:
+                    continue
 
-            seg_df["Avg Power Density (dB FS/Hz)"] = power_results
-            seg_meta_dict.pop('filepath', None)
-            seg_df['Delta Time (s)'] = seg_df['End Time (s)'] - seg_df['Start Time (s)']
-            seg_df['Delta Freq (Hz)'] = seg_df['High Freq (Hz)'] - seg_df['Low Freq (Hz)']
+                # Skip silent/zero segments
+                if not np.any(segment_wav):
+                    continue
+                
+                #skip all really low values
+                if np.sqrt(np.mean(segment_wav ** 2)) < 1e-6:
+                    continue
+                
+                seg_df = self._validate_labels(seg_df, wav, sr)
+                power_results = []
+
+                for idx, row in seg_df.iterrows():
+                    power = avg_power_density(
+                            segment_wav,
+                            sr,
+                            float(row["Start Time (s)"]),
+                            float(row["End Time (s)"]),
+                            float(row["Low Freq (Hz)"]),
+                            float(row["High Freq (Hz)"]),
+                        )
+                    power_results.append(power)
+
+                seg_df["Avg Power Density (dB FS/Hz)"] = power_results
+                seg_meta_dict.pop('filepath', None)
+                seg_df['Delta Time (s)'] = seg_df['End Time (s)'] - seg_df['Start Time (s)']
+                seg_df['Delta Freq (Hz)'] = seg_df['High Freq (Hz)'] - seg_df['Low Freq (Hz)']
+
+            else:
+                #The case where we're just cropping or chunking, but there is no labels data by intention
+                segment_wav = wav[start_idx:end_idx]
+
 
             segments.append({
                 "rel_path": rel_path,
@@ -1527,36 +1649,52 @@ class ToAnqa:
     def convert_one_file(
                         self,
                         filename: str,
-                        df: pd.DataFrame,
                         df_meta: pd.DataFrame,
+                        df: pd.DataFrame | None = None,
+                        prefixed_fname: str | None = None,
                         keep_parent_folder: bool = False
                     ) -> list[dict]:
-        """Convert a single file into a raven-compatible slections table and standard length .flac file"""  
+        """Convert a single file into a Anqa standardised labels and metadata table and standard length .flac file"""  
         source_path = Path(filename)
+        original_fn = str(filename)
         parent_rel = source_path.parent if keep_parent_folder else Path()
+        
         try:
-            df = df.copy()
-            df['Low Freq (Hz)'] = df['Low Freq (Hz)'].clip(lower=self.min_hz)
-            df['High Freq (Hz)'] = df['High Freq (Hz)'].clip(upper=self.max_hz)    
-
+            if df is not None:
+                df = df.copy()
+                df['Low Freq (Hz)'] = df['Low Freq (Hz)'].clip(lower=self.min_hz)
+                df['High Freq (Hz)'] = df['High Freq (Hz)'].clip(upper=self.max_hz)
+                if prefixed_fname is not None:
+                    df['Filename'] = prefixed_fname 
+                
 
             if df_meta is not None:
                 if len(df_meta) != 1:
                     raise ValueError(f"Unexpected duplicate metadata rows for {df_meta.iloc[0].get('filename')}, {len(df_meta)} rows found")
+                if prefixed_fname is not None:
+                    df_meta['filename'] = prefixed_fname 
                 meta_dict = df_meta.iloc[0].to_dict()
                 # Ensure source_filename is populated from existing filename
                 if 'source_filename' not in meta_dict or pd.isna(meta_dict['source_filename']):
                     meta_dict['source_filename'] = meta_dict.get('filename')
 
             wav, sr = load_audio(self.source_dir / filename)
+            if prefixed_fname is not None:
+                filename = prefixed_fname
+            
 
             if wav is None: return []
+            if len(wav) / sr < self.min_seconds:
+                return []
+            
+
+
 
             results_list = []
 
             if self.save_audio:
                 # Consume the generator one segment at a time
-                for segment in self.segment_audio(wav, sr, filename, df, meta_dict, parent_rel=parent_rel):
+                for segment in self.segment_audio(wav, sr, filename, meta_dict, label_df=df, parent_rel=parent_rel):
                     self.save_one_segment(segment)
                     
                     # IMPORTANT: Extract what we need for the CSV, then let the 'wave' die
@@ -1576,40 +1714,63 @@ class ToAnqa:
 
         except Exception as e:
             # optional logging
-            print(f"Skipping {filename} due to IO error: {e}")
+            print(f"Skipping {original_fn} due to IO error: {e}")
         return None 
 
 
     def convert_all(
         self,
-        df_labels: pd.DataFrame,
         df_meta: pd.DataFrame,
-        keep_parent_folder: bool = False
+        df_labels: pd.DataFrame | None,
+        keep_parent_folder: bool = False,
+        prefix_dict: dict | None = None
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Convert all grouped recordings from two DataFrames using different grouping columns."""
         #print(f'Original length of the labels df')
 
-        df_labels = df_labels[df_labels.groupby("Filename")["Filename"].transform("count") >= self.min_labels]
-        grouped_labels = df_labels.groupby('Filename')
+        if df_labels is not None:
+            df_labels = df_labels[df_labels.groupby("Filename")["Filename"].transform("count") >= self.min_labels]
+
+        #prefix the filenames here if need be, to avoid loosing or corrupting anything with name clashes.
+
+        #print(df_meta[df_meta['filename'].str.startswith('/')].head())
+        #print(df_labels.head())
         grouped_meta = df_meta.groupby('filename')
 
         # Find filenames that exist in both
-        #common_filenames = grouped_labels.groups.keys() & grouped_meta.groups.keys()
-        
-        common_filenames = [fname for fname in df_labels['Filename'].unique() if fname in grouped_meta.groups]
+        if self.require_labels:
+            if df_labels is None:
+                raise ValueError('df_labels can not be None because this instance has require_labels = True')
+            filenames_to_process = [fname for fname in grouped_meta.groups if fname in df_labels['Filename'].unique()]
+        else:
+            filenames_to_process = [fname for fname in grouped_meta.groups]
 
-        # Build a list of (filename, group_from_df1, group_from_df2)
-        groups = [(fname, grouped_labels.get_group(fname), grouped_meta.get_group(fname)) for fname in common_filenames]
+        if df_labels is not None:
+            grouped_labels = df_labels.groupby('Filename')
+            labels_group_dict = {fn: grouped_labels.get_group(fn) for fn in df_labels['Filename']}
+        else:
+            dummy = pd.DataFrame(columns=['Filename'])
+            grouped_labels = dummy.groupby('Filename')
+            labels_group_dict = {}
+
+
+        if prefix_dict is None:
+            prefix_dict = {fn : fn for fn in filenames_to_process}
+
+
+        # Build a list of (filename, group_from_df_meta, group_from df_labels)
+        groups = [(fname, grouped_meta.get_group(fname), labels_group_dict.get(fname) , prefix_dict.get(fname))  for fname in filenames_to_process]  #grouped_labels.get_group(fname)
+        #print('hello world')
 
         if self.parallel:
             results = Parallel(n_jobs=self.n_jobs)(
-                delayed(self.convert_one_file)(fname, labels, metadata, keep_parent_folder)
-                for fname, labels, metadata in tqdm(groups, desc="Converting recordings")
+                delayed(self.convert_one_file)(fname, metadata, labels, pfname, keep_parent_folder)
+                for fname,  metadata, labels, pfname in tqdm(groups, desc="Converting recordings")
             )
         else:
             results = [
-                        self.convert_one_file(fname, labels, metadata, keep_parent_folder)
-                        for fname, labels, metadata in tqdm(groups, desc="Converting recordings")
+                        self.convert_one_file(fname, metadata, labels, pfname, keep_parent_folder)
+                        for fname, metadata, labels, pfname in tqdm(groups, desc="Converting recordings")
                         ]
 
         results = [r for r in results if r is not None]
@@ -1697,6 +1858,7 @@ SCHEMA = {
     "source_end_s": "object",
     "length_s": "float64",
     "models_used": "object",
+    "guano": "object",
     
     "Filename": "object",
     "Start Time (s)": "float64",
@@ -1738,6 +1900,42 @@ def normalize_to_schema(df, schema):
             df[col] = df[col].astype("object")
 
     return df
+
+
+def normalize_secondary_labels(x):
+    # Missing values
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return []
+
+    # Already correct
+    if isinstance(x, list):
+        return [str(i) for i in x]
+
+    # Tuple → list
+    if isinstance(x, tuple):
+        return [str(i) for i in x]
+
+    # NumPy array → list
+    if isinstance(x, np.ndarray):
+        return [str(i) for i in x.tolist()]
+
+    # Stringified list (most important case)
+    if isinstance(x, str):
+        try:
+            parsed = ast.literal_eval(x)
+
+            # parsed could still be weird (single string, etc.)
+            if isinstance(parsed, (list, tuple)):
+                return [str(i) for i in parsed]
+            else:
+                return [str(parsed)]
+
+        except Exception:
+            # fallback: treat as single label string
+            return [x]
+
+    # Fallback (unknown type)
+    return [str(x)]
 
 
 def concat_dataframes(
@@ -1813,7 +2011,6 @@ def concat_dataframes(
             )
 
     return out
-
 
 
 def merge_anqa_data(root_dir: str | Path,
@@ -2013,7 +2210,6 @@ class VoiceDetector():
         self.chunk_len=chunk_len
         self.threshold=threshold
         self.get_stamps = get_speech_timestamps
-        self.voice_threshold 
 
     def detect(self, np_wav: np.ndarray) -> np.ndarray:
         speech_timestamps = self.get_stamps(torch.Tensor(np_wav), self.model, threshold=self.threshold)
@@ -2062,6 +2258,7 @@ class MelSpecMaker():
         mel_frequencies = librosa.mel_frequencies(n_mels=self.n_mels, fmin=self.f_min, fmax=self.f_max)
 
         return mel_spec_db, time_axis, mel_frequencies
+
 
 def interactive_plot(mel_spec_db,
                      mel_frequencies,
@@ -2113,13 +2310,6 @@ def interactive_plot(mel_spec_db,
             line3 = ax.axvline(time, color='g', linestyle='--', zorder=4)
             marked_lines.append((line1, line2, line3, area))
             fig.canvas.draw_idle()
-
-    def onclick(event):
-        nonlocal dragging, start_time
-        if event.inaxes is not None and event.button == 1:
-            dragging = True
-            start_time = round(event.xdata, 1)
-            add_marker(start_time)
 
     def onmotion(event):
         if dragging and event.inaxes is not None:
@@ -2388,3 +2578,426 @@ def show_audio_labels(
 
     return Audio(data=audio, rate=sr)
 
+
+#########################################################################################################
+#####################################    Crop Extraction Methods   ######################################
+#########################################################################################################
+
+MIN_COLS = ["Start Time (s)", "Low Freq (Hz)"]
+MAX_COLS = ["End Time (s)", "High Freq (Hz)"]
+RECALC = {   # applied after aggregation, in order
+    "Centre":   lambda d: (d["Start Time (s)"] + d["End Time (s)"]) / 2,
+    "Delta Freq (Hz)": lambda d: d["High Freq (Hz)"] - d["Low Freq (Hz)"],
+    "Delta Time (s)": lambda d: d["End Time (s)"] - d["Start Time (s)"],
+}
+
+def merge_close_rows(df, min_sep=1.0):
+    df['Centre'] = df['Start Time (s)'] + df['Delta Time (s)'] / 2
+    df = df.sort_values(["Filename", "Centre"]).reset_index(drop=True)
+    cand_mask = df["Label"] == df["Primary"]
+    cand, rest = df[cand_mask].copy(), df[~cand_mask]
+
+    # New cluster whenever the gap to the previous row in the same file exceeds min_sep.
+    # diff() is NaN on the first row of each file, so clusters never span files.
+    gap = cand.groupby("Filename")["Centre"].diff()
+    cand["cluster"] = (gap.isna() | (gap > min_sep)).cumsum()
+
+    # Everything not min/max/recalculated takes the first value (these columns match within a cluster)
+    special = set(MIN_COLS) | set(MAX_COLS) | set(RECALC)
+    agg = {c: "first" for c in cand.columns if c not in special | {"cluster"}}
+    agg |= {c: "min" for c in MIN_COLS} | {c: "max" for c in MAX_COLS}
+
+    merged = cand.groupby("cluster", as_index=False).agg(agg)
+    for col, fn in RECALC.items():
+        merged[col] = fn(merged)
+
+    df = (
+        pd.concat([merged, rest], ignore_index=True)[df.columns]
+        .sort_values(["Filename", "Centre"], ignore_index=True)
+        )
+
+    
+    df['Delta Time (s)'] = df['End Time (s)'] - df['Start Time (s)']
+    df['Avg Power Density (dB FS/Hz)'] = np.nan
+    df = df.drop(columns = ['Centre'])
+
+    return df
+
+
+
+def reprioritise_primary(df_meta,
+                         df_label,
+                         priority=["Filename", "num_in_dataset", "time_in_file", "num_in_file", "Label"],
+                         ascending=[True, True, False, False, True],
+                         start_col="Start Time (s)",
+                         end_col="End Time (s)",
+                         ):
+    '''Resort the assignment of primary and secondary labels for different use cases.
+       For the 'clean crops' we may want to prioritise globally rare samples,
+       and are trying to remove secondaries by frequency filtering and tight crops.
+
+       For 'base samples', or saving the original source files at full length, we may want
+       primary to mean the label with the most total time in that file (time_in_file),
+       with num_in_file as a tiebreaker. In that case drop "num_in_dataset" from priority.
+    '''
+
+    class_freq = df_label["Label"].value_counts()   # global frequency, lower = rarer
+
+    wanted = df_label["Filename"].isin(df_meta["filename"])
+
+    ordered = (
+        df_label[wanted]
+        .assign(duration=lambda d: d[end_col] - d[start_col])
+        .groupby(["Filename", "Label"])
+        .agg(num_in_file=("Label", "size"),
+             time_in_file=("duration", "sum"))
+        .reset_index()
+        .assign(num_in_dataset=lambda d: d["Label"].map(class_freq))
+        .sort_values(priority, ascending=ascending)
+        .groupby("Filename")["Label"]
+        .agg(list)
+    )
+
+    df_meta["primary_label"] = df_meta["filename"].map(ordered.str[0])
+    df_meta["secondary_labels"] = df_meta["filename"].map(ordered.str[1:])
+
+    # files with no labels get NaN from map; make secondary an empty list instead
+    df_meta["secondary_labels"] = df_meta["secondary_labels"].apply(
+        lambda x: x if isinstance(x, list) else []
+    )
+    return df_meta, df_label
+
+
+def split_long_primary_boxes(
+    df: pd.DataFrame,
+    max_delta: float = 8,
+    target_chunk: float = 6,
+    max_output_ratio: float = 3,
+) -> pd.DataFrame:
+    """Split primary rows (Label == Primary) with delta > max_delta into
+    ceil(delta / target_chunk) equal chunks. All other rows pass through unchanged."""
+    start = df['Start Time (s)'].to_numpy()
+    delta = df['End Time (s)'].to_numpy() - start          # derived, not the stored column
+    primary = (df['Label'] == df['Primary']).to_numpy()
+    to_split = primary & (delta > max_delta)
+
+    n_chunks = np.where(to_split, np.ceil(delta / target_chunk), 1).astype(int)
+
+    n_total = int(n_chunks.sum())
+    if n_total > max_output_ratio * len(df):
+        raise ValueError(
+            f"Split would produce {n_total} rows from {len(df)} "
+            f"(max delta = {delta.max():.1f}s). Check units / start-end values."
+        )
+
+    pos = np.repeat(np.arange(len(df)), n_chunks)
+    out = df.iloc[pos].copy()
+
+    chunk_idx = pd.Series(pos).groupby(pos).cumcount().to_numpy()
+    chunk_len = delta[pos] / n_chunks[pos]
+
+    out['Start Time (s)'] = start[pos] + chunk_idx * chunk_len
+    out['End Time (s)'] = out['Start Time (s)'] + chunk_len
+    out['Delta Time (s)'] = out['End Time (s)'] - out['Start Time (s)']
+
+    return out.reset_index(drop=True)
+
+
+
+def align_crops(df: pd.DataFrame,
+                min_seconds: float,
+                max_seconds: float, 
+                buffer_seconds: float,
+                max_clip_len_seconds: float,
+                apply_to_primary_only: bool = False,
+                ) -> pd.DataFrame:
+
+    '''Modify the boxes of the primary labels so that they have some minimum buffer 
+       and are within [min_seconds, max_seconds].  The max_seconds overrides the min_buffer
+       for samples too long to fit in max_seconds with a buffer.
+
+       To crop to a fixed size, set min_seconds = max_seconds = desired length
+    '''
+    
+    if apply_to_primary_only:
+        row_mask = df['Label'] == df['Primary']
+    else:
+        row_mask = df['Label'].notna()
+
+    df.loc[row_mask, 'Start Time (s)'] -= buffer_seconds
+    df.loc[row_mask, 'End Time (s)']   += buffer_seconds
+
+    centre = (df['Start Time (s)'] + df['End Time (s)']) / 2
+    dur = (df['End Time (s)'] - df['Start Time (s)']).clip(min_seconds, max_seconds)
+
+    start = centre - dur / 2
+    start = start.clip(lower=0, upper=max_clip_len_seconds - dur)   # keeps the window inside the clip
+    df.loc[row_mask, 'Start Time (s)'] = start
+    df.loc[row_mask, 'End Time (s)'] = start + dur
+    df.loc[row_mask, 'Delta Time (s)'] = dur
+    
+    return df
+
+
+
+
+
+def load_file(path):
+    try:
+        waveform, sr = torchaudio.load(path)
+        y = waveform.numpy()
+        if y.shape[0] == 2:
+            y = y.mean(axis=0)
+        else:
+            y = y.squeeze()
+
+        loaded_length = len(y)//sr
+        if loaded_length <= 20:
+            print(f'Warning, the loaded clip length is only {loaded_length} seconds for the file {path}')
+        return y, sr, len(y)//sr
+    except Exception as e:
+        print(f"Error processing file {path}: {e}")
+        return None, None, None
+
+
+def butter_bandpass_filter(
+    waveform,
+    sr,
+    lowcut=None,
+    highcut=None,
+    order=4,
+):
+    """
+    Apply Butterworth low/high/band-pass filter.
+
+    Parameters
+    ----------
+    waveform : np.ndarray
+        1D audio waveform.
+    sr : int
+        Sample rate.
+    lowcut : float or None
+        Lower frequency bound in Hz.
+    highcut : float or None
+        Upper frequency bound in Hz.
+    order : int
+        Butterworth filter order.
+
+    Returns
+    -------
+    np.ndarray
+        Filtered waveform.
+    """
+
+    nyquist = sr / 2
+
+    # Clamp safely
+    if lowcut is not None:
+        lowcut = max(1.0, min(lowcut, nyquist - 1))
+
+    if highcut is not None:
+        highcut = max(1.0, min(highcut, nyquist - 1))
+
+    # No filtering
+    if lowcut is None and highcut is None:
+        return waveform
+
+    # Band-pass
+    if lowcut is not None and highcut is not None and lowcut < highcut:
+        sos = butter(
+            order,
+            [lowcut, highcut],
+            btype="band",
+            fs=sr,
+            output="sos",
+        )
+
+    # High-pass only
+    elif lowcut is not None:
+        sos = butter(
+            order,
+            lowcut,
+            btype="highpass",
+            fs=sr,
+            output="sos",
+        )
+
+    # Low-pass only
+    else:
+        sos = butter(
+            order,
+            highcut,
+            btype="lowpass",
+            fs=sr,
+            output="sos",
+        )
+
+    return sosfiltfilt(sos, waveform)
+
+
+
+def _extract_crop(y: np.ndarray, sr: int, start: float, end: float,
+                  default_sr: int) -> np.ndarray:
+    """Slice [start, end) seconds from y and resample to default_sr if needed."""
+    crop = y[int(start * sr):int(end * sr)]
+    if sr != default_sr:
+        crop = resample(crop, int(len(crop) * default_sr / sr))
+    return crop
+
+
+def _write_crop(crop: np.ndarray, path: Path, sr: int) -> bool:
+    try:
+        assert isinstance(crop, np.ndarray)
+        sf.write(path, crop, sr)
+        return True
+
+    except Exception as e:
+        print(f'There was an error {e} writing file {path}')
+        return False
+
+
+def _realign_labels(df_file_labels: pd.DataFrame, primary_label: str,
+                    crop_start: float, crop_len_s: float,
+                    keep_secondary: bool) -> pd.DataFrame:
+    """Original labels for one source file, shifted to be relative to the crop
+    start and kept only if they fall wholly inside the crop."""
+    df = df_file_labels
+    if not keep_secondary:
+        df = df[df['Label'] == primary_label]
+    df = df.copy()
+
+    df['Start Time (s)'] -= crop_start
+    df['End Time (s)'] -= crop_start
+    df = df[(df['Start Time (s)'] >= 0) & (df['End Time (s)'] <= crop_len_s)]
+    df['Start Time (s)'] = df['Start Time (s)'].clip(lower=0)
+    df['End Time (s)'] = df['End Time (s)'].clip(upper=crop_len_s)
+    return df
+
+
+def _make_meta_record(meta_row: pd.Series, new_filename: str,
+                      source_start: float, crop_start: float, crop_end: float,
+                      secondaries: list, keep_secondary: bool) -> dict:
+    record = meta_row.to_dict()
+    record['filename'] = new_filename
+    record['source_start_s'] = source_start + crop_start
+    record['source_end_s'] = source_start + crop_end
+    record['secondary_labels'] = str(secondaries) if keep_secondary else str([])
+    return record
+
+
+def _crops_for_file(meta_row: pd.Series,
+                    df_crop_defn: pd.DataFrame,
+                    df_original_labels: pd.DataFrame,
+                    source: Path,
+                    destination: Path,
+                    default_sr: int,
+                    filter_freq: bool,
+                    filter_margin_hz: float,
+                    filter_order: int,
+                    keep_secondary: bool) -> tuple[list[dict], list[pd.DataFrame]]:
+    """Make, write and describe every crop for a single source recording."""
+    primary_label = meta_row['primary_label']
+    filename = meta_row['filename']
+
+    filepath = source / filename
+    y, sr, original_length = load_file(filepath)
+    if y is None or sr is None or original_length is None:
+        return [], []
+
+    crop_defs = df_crop_defn[(df_crop_defn['Label'] == primary_label) &
+                             (df_crop_defn['Filename'] == filename)]
+    file_labels = df_original_labels[df_original_labels['Filename'] == filename]
+
+    dstn_fldr = destination / str(primary_label)
+    source_start = meta_row['source_start_s']
+
+    records, labels = [], []
+    for i, (_, row) in enumerate(crop_defs.iterrows()):
+        start, end = row['Start Time (s)'], row['End Time (s)']
+
+        crop = _extract_crop(y, sr, start, end, default_sr)
+        if len(crop) < 100:
+            continue
+
+        if filter_freq:
+            crop = butter_bandpass_filter(
+                crop,
+                sr=default_sr,
+                lowcut=max(0, row['Low Freq (Hz)'] - filter_margin_hz),
+                highcut=row['High Freq (Hz)'] + filter_margin_hz,
+                order=filter_order,
+            )
+
+        dstn_path = dstn_fldr / f'{filepath.stem}_{i}.flac'
+
+        if not dstn_fldr.exists:
+            dstn_fldr.mkdir(parents=True)
+            
+        successful_write = _write_crop(crop, dstn_path, default_sr)
+
+        crop_labels = _realign_labels(file_labels, primary_label, start,
+                                      len(crop) / default_sr, keep_secondary)
+
+        crop_labels['Filename'] = primary_label + '/' + dstn_path.name
+        
+        secondaries = [l for l in crop_labels['Label'] if l != primary_label]
+
+        if successful_write:
+            records.append(_make_meta_record(
+                meta_row, f'{primary_label}/{dstn_path.name}',
+                source_start, start, end, secondaries, keep_secondary))
+            labels.append(crop_labels)
+
+    return records, labels
+
+
+def make_crops(df_meta: pd.DataFrame,
+               df_crop_defn: pd.DataFrame,
+               df_original_labels: pd.DataFrame,
+               source: Path,
+               destination: Path,
+               default_sr: int = 32000,
+               filter_freq: bool = True,
+               filter_margin_hz: float = 0,
+               filter_order: int = 4,
+               keep_secondary: bool = False,
+               debug: bool = False,
+               n_jobs: int = -1) -> tuple[pd.DataFrame, pd.DataFrame]:
+    '''Makes crops from df_crop_defn for each recording in df_meta.
+
+    Crop boundaries come from df_crop_defn (e.g. tight crops with a buffer, or
+    fixed-length crops). Labels are taken from df_original_labels and re-aligned
+    to each crop so the original annotation boundaries are preserved, with
+    overlapping non-primary labels reported as secondary_labels.
+
+    (Optional) filter_freq applies a Butterworth band-pass around the primary
+    label's frequency range.
+
+    Recordings are processed in parallel across n_jobs workers (-1 = all cores).
+    '''
+    if debug:
+        df_meta = df_meta.iloc[:21]
+
+    crop_groups = {k: g for k, g in df_crop_defn.groupby('Filename')}
+    label_groups = {k: g for k, g in df_original_labels.groupby('Filename')}
+    empty_crops, empty_labels = df_crop_defn.iloc[:0], df_original_labels.iloc[:0]
+
+    jobs = (
+        delayed(_crops_for_file)(
+            meta_row,
+            crop_groups.get(meta_row['filename'], empty_crops),
+            label_groups.get(meta_row['filename'], empty_labels),
+            source, destination, default_sr, filter_freq,
+            filter_margin_hz, filter_order, keep_secondary)
+        for _, meta_row in df_meta.iterrows()
+    )
+    # return_as='generator' yields results in order as they finish, so tqdm
+    # tracks completed files rather than just dispatched ones (joblib >= 1.3).
+    results = Parallel(n_jobs=n_jobs, return_as='generator')(jobs)
+
+    metadata_records, labels = [], []
+    for records, file_labels in tqdm(results, total=len(df_meta)):
+        metadata_records.extend(records)
+        labels.extend(file_labels)
+
+    return pd.DataFrame(metadata_records), pd.concat(labels)
