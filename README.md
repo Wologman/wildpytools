@@ -8,6 +8,7 @@ The package is expected to include:
 * **Plotting Helpers** - Plotting tools for work in the above context.
 * **Data Methods** - Methods for sampling and organising wildlife data such as audio crops and camera trap imagery.
 * **Annotation Methods** - Jupyter Notebook based annotation for working with specialised data such as audio crops or tracking cards.
+* **Calibration Methods** - Methods for calibrating results from wildlife classifiers
 
 ## Installation
 
