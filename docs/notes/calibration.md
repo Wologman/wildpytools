@@ -28,7 +28,7 @@ All deep learning models contain at least some systematic bias related to their 
 
 ## Calibration Methods 
 
-The following was written specifically for Kaytoo and/or Alita, which were both treated as multi-label classification problems.  The argument is similar for all wildlife classification problems.  At a bare minimum, some informed choice of threshold must be chosen.  But for a more interpretable result, we could consider leaving the threshold at 0.5 and scaling the raw predictions.
+The following was written specifically for Kaytoo and/or Alita, which were both treated as multi-label classification problems.  The argument is similar for all wildlife classification problems.  At a bare minimum, some informed choice of threshold must be made.  But for a more interpretable result, we could consider leaving the threshold at 0.5 and scaling the raw predictions.
 
 ### Instance-level scaling
 By this I mean maximising the chance of a correct prediction for a single image (or chunk of sound).
