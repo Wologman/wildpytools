@@ -28,7 +28,7 @@ All deep learning models contain at least some systematic bias related to their 
 
 ## Calibration Methods 
 
-The following was written specifically for Kaytoo and/or Alita, which were both treated as multi-label classification problems.  The argument is similar for all wildlife classification problems.  At a bare minimum, some informed choice of threshold must be chosen.  But for a more interpretable result, we could consider scaling the raw predictions.
+The following was written specifically for Kaytoo and/or Alita, which were both treated as multi-label classification problems.  The argument is similar for all wildlife classification problems.  At a bare minimum, some informed choice of threshold must be chosen.  But for a more interpretable result, we could consider leaving the threshold at 0.5 and scaling the raw predictions.
 
 ### Instance-level scaling
 By this I mean maximising the chance of a correct prediction for a single image (or chunk of sound).
@@ -68,11 +68,11 @@ Though this is a second order effect, it is often these changes that are of most
 
 Strictly speaking this isn't calibration, though it also achieves the goal of reducing error by adapting to the domain at hand.
 
-The idea is to build a local correction model for the predictions on top of the original model, to improve the scores and adapt the predictions to their current environment, thus reducing the absolute error.   The metric is maximum information improvement for given amount of expert labelling effort.
+The idea is to build a local correction model for the predictions on top of the original model, to adapt the predictions to their current environment.  Thus reducing the absolute error without further changes to threshold choice.   The goal is maximum information improvement for given amount of expert labelling effort.
 
-Future versions of both Kaytoo and Alita will do something like output the backbone embedding vector for each image or audio segment. In the case of audio, we may involve the attention weights in tis as well, and consider the differing results from multiple backbones.  This will let us build a small correction model in-situ on a per-project basis.  It takes us days on a high performance machine to train the full deep learning model from scratch,  but only minutes or seconds to train a small embeddings based model on a few hundred samples.
+Future versions of both Kaytoo and Alita will do something like output the backbone embedding vector for each image or audio segment. In the case of audio, we may also involve the attention weights, and consider the differing results from multiple backbones.  From those outputs we perform some clustering and sub-selection decisions to identify the most informative samples for human-in loop labelling.  Once those samples are labelled the correction model can then be trained retrained.  
 
-The embeddings will be used together with some clustering and sub-selection decisions to identify the most informative samples for human-in loop labelling.  Once those samples are labelled the correction model can then be trained retrained.  This process continues iteratively in small batches until there are no more outliers or scores near the decision threshold.  
+The process continues iteratively in small batches, ideally until there are no more outliers or scores near the decision threshold.  With the embeddings we let us build a small correction model in-situ on a per-project basis. It takes only minutes or seconds to train a small embeddings based model on a few hundred samples.
 
 This approach reduces the problem overlapping prediction scores by learning from and correcting for local features, greatly reducing the size of any error for a modest amount of human-in-loop annotation.  In the case of audio, additional measured features (for example background noise, or detection of rain) could be added at the same stage.
 
