@@ -3,6 +3,7 @@ from pathlib import Path
 from collections import Counter, defaultdict
 import json
 from typing import Optional, Union, Sequence, Literal, Tuple, Set, List, Iterable
+from dataclasses import dataclass
 import re
 import xml.etree.ElementTree as ET
 from tqdm import tqdm
@@ -16,7 +17,6 @@ import plotly.express as px
 import matplotlib.pyplot as plt
 import torchaudio.transforms as T
 import ast
-from scipy.signal import resample
 from typing import Literal
 from joblib import Parallel, delayed
 import soundfile as sf
@@ -1342,7 +1342,7 @@ class ToAnqa:
                  require_labels: bool = True,
                  max_seconds: float = 60,
                  min_seconds: float = 2,
-                 max_hz: int = 1600,
+                 max_hz: int = 16000,
                  min_hz: int = 0,
                  end_padding: Literal['pad', 'noise', 'zero', None] = None,
                  crop_method: Literal['keep_all', 'bbox', 'no_crop'] = 'keep_all', # Future: 'random', 'max_annotations', 'max_detections'
@@ -1375,7 +1375,6 @@ class ToAnqa:
         self.parallel = False if n_jobs == 0 else True
         self.buffer_seconds = buffer_seconds
         self.max_segments = max_segments
-        
 
         # --- Validation check ---
         if self.save_audio and self.source_dir == self.destn_dir:
@@ -1686,8 +1685,6 @@ class ToAnqa:
             if wav is None: return []
             if len(wav) / sr < self.min_seconds:
                 return []
-            
-
 
 
             results_list = []
@@ -1760,7 +1757,6 @@ class ToAnqa:
 
         # Build a list of (filename, group_from_df_meta, group_from df_labels)
         groups = [(fname, grouped_meta.get_group(fname), labels_group_dict.get(fname) , prefix_dict.get(fname))  for fname in filenames_to_process]  #grouped_labels.get_group(fname)
-        #print('hello world')
 
         if self.parallel:
             results = Parallel(n_jobs=self.n_jobs)(
@@ -2488,6 +2484,10 @@ def show_audio_labels(
     if cfg["FMAX"] is None:
         cfg["FMAX"] = sr / 2
 
+    #tone_hz = 5218   
+    t = np.arange(len(audio)) / sr
+    audio = audio #+ #0.3 * np.abs(audio).max() * np.sin(2 * np.pi * tone_hz * t)
+
     # --- Mel spectrogram ---
     S = librosa.feature.melspectrogram(
         y=audio,
@@ -2505,10 +2505,10 @@ def show_audio_labels(
 
     # --- Mel bin centre frequencies (Hz) ---
     mel_centres_hz = librosa.mel_frequencies(
-        n_mels=n_mels,
-        fmin=cfg["FMIN"],
-        fmax=cfg["FMAX"]
-    )
+    n_mels=n_mels + 2,
+    fmin=cfg["FMIN"],
+    fmax=cfg["FMAX"],
+    )[1:-1]
 
     # --- Plot ---
     fig, ax = plt.subplots(figsize=(12, 5))
@@ -2535,6 +2535,8 @@ def show_audio_labels(
     ax.set_xticklabels(
         [f"{(i * cfg['HOP_LENGTH'] / sr):.1f}" for i in xticks]
     )
+
+    ax.grid()
     ax.set_xlabel("Time (s)")
 
     ax.set_title(f"Mel spectrogram + labels — {filename}")
@@ -2625,12 +2627,13 @@ def merge_close_rows(df, min_sep=1.0):
 
 
 
-def reprioritise_primary(df_meta,
-                         df_label,
-                         priority=["Filename", "num_in_dataset", "time_in_file", "num_in_file", "Label"],
-                         ascending=[True, True, False, False, True],
-                         start_col="Start Time (s)",
-                         end_col="End Time (s)",
+def reprioritise_primary(df_meta: pd.DataFrame,
+                         df_label: pd.DataFrame,
+                         priority: tuple[str, ...]=("Filename", "num_in_dataset", "time_in_file", "num_in_file", "Label"),
+                         ascending: tuple[bool, ...] =(True, True, False, False, True),
+                         exclude: list[str] = [],
+                         start_col: str = "Start Time (s)",
+                         end_col: str ="End Time (s)",
                          ):
     '''Resort the assignment of primary and secondary labels for different use cases.
        For the 'clean crops' we may want to prioritise globally rare samples,
@@ -2643,7 +2646,10 @@ def reprioritise_primary(df_meta,
 
     class_freq = df_label["Label"].value_counts()   # global frequency, lower = rarer
 
-    wanted = df_label["Filename"].isin(df_meta["filename"])
+    wanted = (
+    df_label["Filename"].isin(df_meta["filename"])
+    & ~df_label["Label"].isin(exclude)
+    )
 
     ordered = (
         df_label[wanted]
@@ -2653,7 +2659,7 @@ def reprioritise_primary(df_meta,
              time_in_file=("duration", "sum"))
         .reset_index()
         .assign(num_in_dataset=lambda d: d["Label"].map(class_freq))
-        .sort_values(priority, ascending=ascending)
+        .sort_values(list(priority), ascending=list(ascending))
         .groupby("Filename")["Label"]
         .agg(list)
     )
@@ -2670,16 +2676,20 @@ def reprioritise_primary(df_meta,
 
 def split_long_primary_boxes(
     df: pd.DataFrame,
-    max_delta: float = 8,
+    min_seconds_to_chunk: float = 8,
     target_chunk: float = 6,
     max_output_ratio: float = 3,
 ) -> pd.DataFrame:
     """Split primary rows (Label == Primary) with delta > max_delta into
     ceil(delta / target_chunk) equal chunks. All other rows pass through unchanged."""
+    
+    
+    
+    
     start = df['Start Time (s)'].to_numpy()
     delta = df['End Time (s)'].to_numpy() - start          # derived, not the stored column
     primary = (df['Label'] == df['Primary']).to_numpy()
-    to_split = primary & (delta > max_delta)
+    to_split = primary & (delta > min_seconds_to_chunk)
 
     n_chunks = np.where(to_split, np.ceil(delta / target_chunk), 1).astype(int)
 
@@ -2702,6 +2712,48 @@ def split_long_primary_boxes(
 
     return out.reset_index(drop=True)
 
+
+
+def buffer_freq_box(f_low, f_high, sr, n_mels=256, fmin=0.0, fmax=None,
+                    buffer_bins=8):
+    """Works on scalars or array-likes (including Series). sr can be scalar or per-row."""
+    f_low = np.asarray(f_low, dtype=float)
+    f_high = np.asarray(f_high, dtype=float)
+    nyq = np.asarray(sr, dtype=float) / 2
+    fmax = nyq if fmax is None else fmax
+
+    mel_lo, mel_hi = librosa.hz_to_mel(fmin), librosa.hz_to_mel(fmax)
+    bin_width = (mel_hi - mel_lo) / (n_mels + 1)
+
+    lo = librosa.mel_to_hz(librosa.hz_to_mel(f_low) - buffer_bins * bin_width)
+    hi = librosa.mel_to_hz(librosa.hz_to_mel(f_high) + buffer_bins * bin_width)
+
+    return np.maximum(lo, 1.0), np.minimum(hi, nyq * 0.99)
+
+
+def buffer_freq_columns(df, low_col="Low Freq (Hz)", high_col="High Freq (Hz)",
+                       sr=None, sr_col=None, **kwargs):
+    sr_vals = df[sr_col] if sr_col is not None else sr
+    lo, hi = buffer_freq_box(df[low_col], df[high_col], sr_vals, **kwargs)
+    return df.assign(**{low_col: np.round(lo,1), high_col: np.round(hi,1)})
+
+
+def standardise_col(df: pd.DataFrame,
+                    grouping_col: str,
+                    value_col: str,
+                    percentile: float,
+                    interpolate_up: bool = True,
+                    ) -> pd.DataFrame:
+    '''Replace each value in value_col with the given percentile of its group.
+       percentile in [0, 100],
+    '''
+
+    interpolation = 'higher' if interpolate_up else 'lower'
+    df = df.copy()
+    df[value_col] = df.groupby(grouping_col)[value_col].transform(
+        lambda s: s.quantile(percentile/100, interpolation=interpolation)
+    )
+    return df
 
 
 def align_crops(df: pd.DataFrame,
@@ -2737,8 +2789,6 @@ def align_crops(df: pd.DataFrame,
     df.loc[row_mask, 'Delta Time (s)'] = dur
     
     return df
-
-
 
 
 
@@ -2856,11 +2906,8 @@ def _write_crop(crop: np.ndarray, path: Path, sr: int) -> bool:
         return False
 
 
-def _realign_labels(df_file_labels: pd.DataFrame, primary_label: str,
-                    crop_start: float, crop_len_s: float,
-                    keep_secondary: bool) -> pd.DataFrame:
-    """Original labels for one source file, shifted to be relative to the crop
-    start and kept only if they fall wholly inside the crop."""
+def _realign_labels(df_file_labels, primary_label, crop_start, crop_len_s,
+                    keep_secondary, crop_high_f, crop_low_f, bandpass_filter_used):
     df = df_file_labels
     if not keep_secondary:
         df = df[df['Label'] == primary_label]
@@ -2868,7 +2915,16 @@ def _realign_labels(df_file_labels: pd.DataFrame, primary_label: str,
 
     df['Start Time (s)'] -= crop_start
     df['End Time (s)'] -= crop_start
-    df = df[(df['Start Time (s)'] >= 0) & (df['End Time (s)'] <= crop_len_s)]
+
+    is_primary = df['Label'] == primary_label
+    whole = (df['Start Time (s)'] >= 0) & (df['End Time (s)'] <= crop_len_s)
+    overlaps = (df['End Time (s)'] > 0) & (df['Start Time (s)'] < crop_len_s)
+    df = df[whole | (is_primary & overlaps)]
+
+    if bandpass_filter_used:
+        in_band = (df['High Freq (Hz)'] <= crop_high_f) & (df['Low Freq (Hz)'] >= crop_low_f)
+        df = df[(df['Label'] == primary_label) | in_band].copy()
+
     df['Start Time (s)'] = df['Start Time (s)'].clip(lower=0)
     df['End Time (s)'] = df['End Time (s)'].clip(upper=crop_len_s)
     return df
@@ -2884,6 +2940,25 @@ def _make_meta_record(meta_row: pd.Series, new_filename: str,
     record['secondary_labels'] = str(secondaries) if keep_secondary else str([])
     return record
 
+def apply_db_fade(crop, sr, fade_buffer, floor_db=-60.0):
+    """
+    Fade in at the start and out at the end, linear in dB over `fade_buffer` seconds.
+    Gain goes from `floor_db` up to 0 dB; the first/last sample is set to exact silence.
+    """
+    n = int(round(fade_buffer * sr))
+    n = min(n, len(crop) // 2)          # never let the two fades overlap
+    if n < 2:
+        return crop
+
+    gain_db = np.linspace(floor_db, 0.0, n)
+    ramp = 10 ** (gain_db / 20)
+    ramp[0] = 0.0                       # -inf dB is not reachable, so force true zero
+
+    out = crop.copy()
+    out[:n] *= ramp
+    out[-n:] *= ramp[::-1]
+    return out
+
 
 def _crops_for_file(meta_row: pd.Series,
                     df_crop_defn: pd.DataFrame,
@@ -2892,18 +2967,24 @@ def _crops_for_file(meta_row: pd.Series,
                     destination: Path,
                     default_sr: int,
                     filter_freq: bool,
-                    filter_margin_hz: float,
                     filter_order: int,
-                    keep_secondary: bool) -> tuple[list[dict], list[pd.DataFrame]]:
+                    keep_secondary: bool,
+                    fade_buffer: float = 0,
+                    fade_floor_db: float = -60) -> tuple[list[dict], list[pd.DataFrame]]:
     """Make, write and describe every crop for a single source recording."""
     primary_label = meta_row['primary_label']
     filename = meta_row['filename']
 
     filepath = source / filename
+
+
+
     y, sr, original_length = load_file(filepath)
     if y is None or sr is None or original_length is None:
+        #print(f'The file {filepath} returned nothing')
         return [], []
 
+    #print(f'Successfully opened {filepath} with length {len(y)/32000} seconds')
     crop_defs = df_crop_defn[(df_crop_defn['Label'] == primary_label) &
                              (df_crop_defn['Filename'] == filename)]
     file_labels = df_original_labels[df_original_labels['Filename'] == filename]
@@ -2919,24 +3000,36 @@ def _crops_for_file(meta_row: pd.Series,
         if len(crop) < 100:
             continue
 
+        low_cut =  max(0, row['Low Freq (Hz)'])
+        high_cut =  row['High Freq (Hz)']
+
         if filter_freq:
             crop = butter_bandpass_filter(
                 crop,
                 sr=default_sr,
-                lowcut=max(0, row['Low Freq (Hz)'] - filter_margin_hz),
-                highcut=row['High Freq (Hz)'] + filter_margin_hz,
+                lowcut=low_cut,
+                highcut=high_cut,
                 order=filter_order,
             )
 
+        if fade_buffer > 0:
+            crop = apply_db_fade(crop, default_sr, fade_buffer, floor_db=fade_floor_db)
+
         dstn_path = dstn_fldr / f'{filepath.stem}_{i}.flac'
 
-        if not dstn_fldr.exists:
+        if not dstn_fldr.exists():
             dstn_fldr.mkdir(parents=True)
             
         successful_write = _write_crop(crop, dstn_path, default_sr)
 
-        crop_labels = _realign_labels(file_labels, primary_label, start,
-                                      len(crop) / default_sr, keep_secondary)
+        crop_labels = _realign_labels(file_labels,
+                                      primary_label,
+                                      start,
+                                      len(crop) / default_sr, 
+                                      crop_low_f = low_cut,
+                                      crop_high_f = high_cut,
+                                      bandpass_filter_used=filter_freq,
+                                      keep_secondary=keep_secondary)
 
         crop_labels['Filename'] = primary_label + '/' + dstn_path.name
         
@@ -2958,9 +3051,9 @@ def make_crops(df_meta: pd.DataFrame,
                destination: Path,
                default_sr: int = 32000,
                filter_freq: bool = True,
-               filter_margin_hz: float = 0,
                filter_order: int = 4,
                keep_secondary: bool = False,
+               fade_buffer: float = 0,
                debug: bool = False,
                n_jobs: int = -1) -> tuple[pd.DataFrame, pd.DataFrame]:
     '''Makes crops from df_crop_defn for each recording in df_meta.
@@ -2988,7 +3081,7 @@ def make_crops(df_meta: pd.DataFrame,
             crop_groups.get(meta_row['filename'], empty_crops),
             label_groups.get(meta_row['filename'], empty_labels),
             source, destination, default_sr, filter_freq,
-            filter_margin_hz, filter_order, keep_secondary)
+            filter_order, keep_secondary, fade_buffer)
         for _, meta_row in df_meta.iterrows()
     )
     # return_as='generator' yields results in order as they finish, so tqdm
@@ -3000,4 +3093,140 @@ def make_crops(df_meta: pd.DataFrame,
         metadata_records.extend(records)
         labels.extend(file_labels)
 
+    print(df_meta['filename'].head(3).tolist())
+    print(list(crop_groups)[:3])
+    print(len(set(df_meta['filename']) & set(crop_groups)))  # 0 means this is your problem
+
+
     return pd.DataFrame(metadata_records), pd.concat(labels)
+
+
+@dataclass(frozen=True)
+class LabelConfig:
+    min_seconds_to_chunk: float = 8 #Break up a long chunk to several of the length max_seconds length if longer than this
+    max_seconds: float = 6    #Crop if needed to reach this time duration
+    min_seconds: float = 3   #Buffer if needed to reach this time duration
+    buffer_seconds: float = 0.5  #Time buffer around the box, unless it goes over max_seconds
+    min_separation: float = 3  #When two box centres are less than this far apart, merge them into one
+    filter_buffer_mel_bins: int = 12 # Buffer around the box equivalent to this many melspec filter bins
+    max_clip_length_seconds: float = 900
+    priority: tuple[str, ...] = ("Filename", "num_in_dataset", "time_in_file", "num_in_file", "Label")
+    ascending: tuple[bool, ...] = (True, True, False, False, True)
+    
+
+@dataclass(frozen=True)
+class CropConfig:
+    src_fldr: Path
+    dstn_fldr: Path
+    sr: int = 32000
+    filter_freq: bool = False
+    keep_secondary: bool = True
+    fade_buffer: float = 0
+
+    def __post_init__(self):
+        object.__setattr__(self, "src_fldr", Path(self.src_fldr))
+        object.__setattr__(self, "dstn_fldr", Path(self.dstn_fldr))
+
+
+def preprocess_labels_for_train(df_meta: pd.DataFrame,
+                                df_labels: pd.DataFrame,
+                                cfg: LabelConfig, 
+                                ):
+
+    ''' Modfies the labels dataframe so that the label boxes are optimal for any subsequent filtering and 
+        cropping steps.'''
+
+    min_seconds: float = cfg.min_seconds #Labels will be buffered to this if needed
+    max_seconds: float = cfg.max_seconds #Labels will be cropped to this if needed
+    min_seconds_to_chunk: float = cfg.min_seconds_to_chunk  #Labels to be split if over this value
+    buffer_seconds: float = cfg.buffer_seconds
+    max_clip_length_seconds: float = cfg.max_clip_length_seconds
+    priority: tuple[str, ...] = cfg.priority
+    ascending: tuple[bool, ...] = cfg.ascending
+
+    df_labels = df_labels.copy()
+    df_meta = df_meta.copy()
+
+    if reprioritise_primary:
+        df_meta, df_labels = reprioritise_primary(df_meta, df_labels, 
+                                                priority=priority,
+                                                ascending=ascending)
+
+    df_labels = df_labels.sort_values(by='Filename')
+    primary_map = dict(zip(df_meta['filename'], df_meta['primary_label']))
+    df_labels['Primary'] = df_labels['Filename'].map(primary_map)
+
+    df_labels = split_long_primary_boxes(df_labels,
+                                         min_seconds_to_chunk = min_seconds_to_chunk,
+                                         target_chunk=max_seconds)
+
+    df_labels = standardise_col(df_labels,
+                                grouping_col= 'Label',
+                                value_col = 'High Freq (Hz)',
+                                percentile = 80,
+                                interpolate_up=True,
+                                )
+
+    df_labels = standardise_col(df_labels,
+                                grouping_col= 'Label',
+                                value_col = 'Low Freq (Hz)',
+                                percentile = 20,
+                                interpolate_up=False,
+                                )
+
+    df_labels = buffer_freq_columns(df_labels, sr=32000, n_mels=256, buffer_bins=12)
+
+    df_labels = align_crops(df_labels,
+                            min_seconds = min_seconds,
+                            max_seconds = max_seconds,
+                            buffer_seconds=buffer_seconds,
+                            max_clip_len_seconds=max_clip_length_seconds)
+
+    return df_meta, df_labels
+   
+   
+def process_train_crops(df_meta: pd.DataFrame,
+                        df_labels: pd.DataFrame,
+                        df_labels_original: pd.DataFrame,
+                        crop_cfg,
+                        debug: bool = False,
+                        n_jobs: int = 8):
+
+    ''' Iterates through the metadata folder, and makes a short crop to the length of the df_labels box.
+        The final label data is taken from the original labels values, without any buffering, alterations etc.
+        If filter_freq is True, the label box around the primary label is used to apply a band-pass filter around the primary
+        label.  This is intended to create 'clean crops'  for mixing with the 'baseline crops' but with minimal extra context.
+        If keep_secondary is true, any overlapping labels (overlapping in both frequency and time with the primary label) 
+        are listed as 'secondary labels
+        '''
+    src_fldr: Path = crop_cfg.src_fldr
+    dstn_fldr: Path = crop_cfg.dstn_fldr
+    filter_freq: bool = crop_cfg.filter_freq
+    keep_secondary: bool = crop_cfg.keep_secondary
+    fade_buffer: float = crop_cfg.fade_buffer
+    default_sr: int = crop_cfg.sr
+
+    unique_primaries = list(df_meta['primary_label'].unique())
+    for primary in unique_primaries:
+        sub_folder_path = dstn_fldr / 'audio' / str(primary)
+        sub_folder_path.mkdir(exist_ok=True, parents = True)
+
+    try:
+        df_new_meta, df_new_labels = make_crops(df_meta,
+                                                df_labels,
+                                                df_labels_original,
+                                                source = src_fldr / 'audio',
+                                                destination = dstn_fldr / 'audio',
+                                                default_sr = default_sr,
+                                                filter_freq = filter_freq,
+                                                keep_secondary=keep_secondary, #False for clean-crops,  true for base samples
+                                                fade_buffer=fade_buffer,
+                                                debug = debug,
+                                                n_jobs = n_jobs,
+                                                )
+
+        df_new_meta.to_parquet(dstn_fldr / 'metadata.parquet')
+        df_new_labels.to_parquet(dstn_fldr / 'annotations.parquet')
+    except Exception as e:
+        print(f'There was an error {e} processing the crops')
+    return
